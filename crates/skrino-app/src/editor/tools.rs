@@ -155,13 +155,26 @@ fn draw_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: 
     let col = c32(color);
     let len = (to - from).length();
     match head {
-        ArrowHead::Filled => {
-            painter.line_segment([from, to], Stroke::new(width, col));
-            draw_arrow_head_triangle(painter, dir, to, width, len, col);
-        }
-        ArrowHead::Dashed => {
-            draw_dashed_shaft(painter, from, to, width, col);
-            draw_arrow_head_triangle(painter, dir, to, width, len, col);
+        ArrowHead::Filled | ArrowHead::Dashed => {
+            // Head length ~3.5x thickness (min 10px), clamped to the arrow's
+            // own length so it never overshoots a very short arrow. The
+            // shaft ends short of the head base by the round-cap radius
+            // (width/2) so the cap stays fully hidden under the triangle
+            // instead of bulging past its base edges; degenerate/short
+            // arrows (where even the pulled-back point lands behind `from`)
+            // skip the shaft and draw the head only.
+            let head_len = (width * 3.5).max(10.0).min(len);
+            let pullback = head_len + width * 0.5;
+            let shaft_len = len - pullback;
+            if shaft_len > 0.0 {
+                let shaft_end = from + dir * shaft_len;
+                if matches!(head, ArrowHead::Dashed) {
+                    draw_dashed_shaft(painter, from, shaft_end, width, col);
+                } else {
+                    painter.line_segment([from, shaft_end], Stroke::new(width, col));
+                }
+            }
+            draw_arrow_head_triangle(painter, dir, to, width, head_len, col);
         }
         ArrowHead::Tapered => {
             draw_tapered_arrow(painter, from, to, dir, width, col);
@@ -170,20 +183,25 @@ fn draw_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: 
 }
 
 /// The filled triangle head shared by `Filled` and `Dashed` arrows. Mirrors
-/// `skrino_core::render`: head length ~3.5x thickness (min 10px), clamped to
-/// the arrow's own length so it never overshoots a very short arrow.
-fn draw_arrow_head_triangle(painter: &egui::Painter, dir: Vec2, to: Pos2, width: f32, arrow_len: f32, color: Color32) {
-    let head_len = (width * 3.5).max(10.0).min(arrow_len);
+/// `skrino_core::render`; `head_len` is computed once by the caller (shared
+/// with the shaft pullback) instead of being recomputed here. The head half
+/// width must stay wide enough that the shaft's round cap (radius width/2)
+/// never peeks past its base edges — `head_len*0.5` already clears this in
+/// practice, but the explicit floor keeps the invariant true if the
+/// constants above ever change.
+fn draw_arrow_head_triangle(painter: &egui::Painter, dir: Vec2, to: Pos2, width: f32, head_len: f32, color: Color32) {
+    let half_w = (head_len * 0.5).max(width * 0.5 + 1.0);
     let perp = Vec2::new(-dir.y, dir.x);
     let base = to - dir * head_len;
-    let left = base + perp * head_len * 0.5;
-    let right = base - perp * head_len * 0.5;
+    let left = base + perp * half_w;
+    let right = base - perp * half_w;
     painter.add(Shape::convex_polygon(vec![to, left, right], color, Stroke::NONE));
 }
 
 /// Dashed shaft: dash ~3x thickness, gap ~2x thickness, starting at the tail.
 /// The filled head triangle is drawn separately (over the dashes near the
-/// tip), matching `Filled`'s shaft-then-head layering.
+/// tip), matching `Filled`'s shaft-then-head layering. `to` here is already
+/// the pulled-back shaft end, not the arrow's tip.
 fn draw_dashed_shaft(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: Color32) {
     let vec = to - from;
     let len = vec.length();
@@ -202,15 +220,45 @@ fn draw_dashed_shaft(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, 
     }
 }
 
+/// Sample a quadratic Bezier (`p0`, control `c`, `p1`) at `n-1` interior
+/// points (excluding both endpoints), for building sampled polygon edges out
+/// of curves — `Shape::convex_polygon` only accepts a flat point list.
+fn sample_quad(p0: Pos2, c: Pos2, p1: Pos2, n: usize) -> Vec<Pos2> {
+    (1..n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let mt = 1.0 - t;
+            Pos2::new(
+                mt * mt * p0.x + 2.0 * mt * t * c.x + t * t * p1.x,
+                mt * mt * p0.y + 2.0 * mt * t * c.y + t * t * p1.y,
+            )
+        })
+        .collect()
+}
+
 /// Tapered "Yandex-style" arrow. Mirrors `skrino_core::render`'s `draw_arrow`
-/// Tapered branch exactly: head length ~3.5x thickness (min 12px), clamped to
-/// <=60% of the arrow's length for short arrows via `k` — and the whole taper
-/// (tail/neck half-widths, not just the head) scales down by that same `k`,
-/// so a short arrow doesn't end up with a disproportionately fat neck.
-/// Drawn as a tapered quad (tail to neck) + a head triangle sharing the neck
-/// edge, which reads as one continuous filled shape (core fills a single
-/// 7-point path; two convex pieces avoid feeding a concave polygon to egui's
-/// fan-triangulating `Shape::convex_polygon`).
+/// Tapered branch's proportions exactly: head length ~3.5x thickness (min
+/// 12px), clamped to <=60% of the arrow's length for short arrows via `k` —
+/// and the whole taper (tail/neck half-widths, not just the head) scales
+/// down by that same `k`, so a short arrow doesn't end up with a
+/// disproportionately fat neck.
+///
+/// The silhouette is softened the same way as core, but via a different
+/// implementation: core fills one path with fillets at every corner
+/// (including the re-entrant one at the neck-to-shoulder transition, which
+/// `tiny-skia`'s winding-rule rasterizer handles natively); egui's
+/// `Shape::convex_polygon` fan-triangulates from vertex 0 and silently
+/// mis-renders a concave outline, so here the shape is split into pieces
+/// that are each convex on their own:
+///   - the shaft (tail to neck), with gently-curved edges and a rounded tail
+///     cap (a plain filled circle of radius `tail_half_w`, overlaid — since
+///     it's the same opaque color and fully nested inside the shaft's width,
+///     the union reads as one smoothly-capped shape);
+///   - the head, drawn as a triangle whose *base* curves back toward the
+///     tail a little (`base_bulge`), which softens the neck-to-wing jump
+///     without introducing a concave vertex, plus small fillets at the two
+///     wing-back corners and the tip (rounding an already-convex corner
+///     keeps the whole piece convex).
 fn draw_tapered_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, dir: Vec2, width: f32, color: Color32) {
     let t = width;
     let len = (to - from).length();
@@ -231,12 +279,60 @@ fn draw_tapered_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, dir: Vec2, 
     let head_left = neck + perp * head_half_w;
     let head_right = neck - perp * head_half_w;
 
-    painter.add(Shape::convex_polygon(
-        vec![tail_left, neck_left, neck_right, tail_right],
-        color,
-        Stroke::NONE,
-    ));
-    painter.add(Shape::convex_polygon(vec![to, head_left, head_right], color, Stroke::NONE));
+    // --- Piece A: shaft (tail to neck). Edges ease ~12% toward the
+    // centerline at their midpoint (a soft concave bow instead of a
+    // razor-straight wedge side); the tail is rounded by an overlaid circle.
+    let ease = |a: Pos2, b: Pos2| -> Pos2 {
+        let mid = a + (b - a) * 0.5;
+        let proj = from + dir * (mid - from).dot(dir);
+        mid + (proj - mid) * 0.12
+    };
+    let ctrl_l = ease(tail_left, neck_left);
+    let ctrl_r = ease(tail_right, neck_right);
+    let mut shaft_pts = vec![tail_left];
+    shaft_pts.extend(sample_quad(tail_left, ctrl_l, neck_left, 8));
+    shaft_pts.push(neck_left);
+    shaft_pts.push(neck_right);
+    shaft_pts.extend(sample_quad(neck_right, ctrl_r, tail_right, 8));
+    shaft_pts.push(tail_right);
+    painter.add(Shape::convex_polygon(shaft_pts, color, Stroke::NONE));
+    if tail_half_w > 0.3 {
+        painter.circle_filled(from, tail_half_w, color);
+    }
+
+    // --- Piece B: head. The base curves back toward the tail a little
+    // (softening the neck-to-wing shoulder instead of a hard right angle);
+    // the wing-back corners and the tip are lightly filleted.
+    let step = (head_half_w - neck_half_w).max(0.0);
+    let base_bulge = (0.5 * step).min(head_half_w * 0.4);
+    let control_base = neck - dir * base_bulge;
+    let wing_r = (0.15 * head_len).min(head_half_w * 0.6);
+    let tip_r = (0.08 * t)
+        .clamp(0.3, 1.0)
+        .min((to - head_left).length() * 0.3)
+        .min((to - head_right).length() * 0.3);
+
+    let dir_htl = (to - head_left).normalized();
+    let dir_htr = (to - head_right).normalized();
+
+    let head_left_in = head_left - perp * wing_r;
+    let head_left_out = head_left + dir_htl * wing_r;
+    let head_right_in = head_right + perp * wing_r;
+    let head_right_out = head_right + dir_htr * wing_r;
+    let tip_left = to - dir_htl * tip_r;
+    let tip_right = to - dir_htr * tip_r;
+
+    let mut head_pts = vec![head_left_in];
+    head_pts.extend(sample_quad(head_left_in, head_left, head_left_out, 6));
+    head_pts.push(head_left_out);
+    head_pts.push(tip_left);
+    head_pts.extend(sample_quad(tip_left, to, tip_right, 6));
+    head_pts.push(tip_right);
+    head_pts.push(head_right_out);
+    head_pts.extend(sample_quad(head_right_out, head_right, head_right_in, 6));
+    head_pts.push(head_right_in);
+    head_pts.extend(sample_quad(head_right_in, control_base, head_left_in, 8));
+    painter.add(Shape::convex_polygon(head_pts, color, Stroke::NONE));
 }
 
 fn ellipse_points(r: egui::Rect, segments: usize) -> Vec<Pos2> {

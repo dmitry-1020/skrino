@@ -429,22 +429,37 @@ fn draw_arrow(
     match head {
         ArrowHead::Filled | ArrowHead::Dashed => {
             let head_len = (t * 3.5).max(10.0).min(len);
-            let half_w = head_len * 0.5;
+            // The head base must be wide enough that the shaft's round cap
+            // (radius t/2) never peeks past its edges, even at small
+            // thicknesses where `head_len` floors at 10px. In practice
+            // `head_len*0.5` already clears this (it floors at 5px, well
+            // above `t/2+1` for any thickness up to and beyond the 12px
+            // maximum), but the explicit floor keeps the invariant true if
+            // those constants ever change.
+            let half_w = (head_len * 0.5).max(t * 0.5 + 1.0);
             let bcx = to.x - ux * head_len;
             let bcy = to.y - uy * head_len;
-            // Shaft stops slightly inside the head base so the two don't seam.
-            let shaft_end_x = to.x - ux * (head_len * 0.9);
-            let shaft_end_y = to.y - uy * (head_len * 0.9);
-            let mut shaft = PathBuilder::new();
-            shaft.move_to(from.x, from.y); // dash phase starts at the tail
-            shaft.line_to(shaft_end_x, shaft_end_y);
-            if let Some(path) = shaft.finish() {
-                let stroke = if matches!(head, ArrowHead::Dashed) {
-                    dashed_stroke(t)
-                } else {
-                    round_stroke(t)
-                };
-                pixmap.stroke_path(&path, &paint, &stroke, tf, None);
+            // Shaft ends short of the head base by the round-cap radius
+            // (t/2) so the cap stays fully hidden under the triangle instead
+            // of bulging past its base edges. Degenerate/short arrows (where
+            // even that pulled-back point would land behind `from`) skip the
+            // shaft and draw the head only.
+            let pullback = head_len + t * 0.5;
+            let shaft_len = len - pullback;
+            if shaft_len > 0.0 {
+                let shaft_end_x = from.x + ux * shaft_len;
+                let shaft_end_y = from.y + uy * shaft_len;
+                let mut shaft = PathBuilder::new();
+                shaft.move_to(from.x, from.y); // dash phase starts at the tail
+                shaft.line_to(shaft_end_x, shaft_end_y);
+                if let Some(path) = shaft.finish() {
+                    let stroke = if matches!(head, ArrowHead::Dashed) {
+                        dashed_stroke(t)
+                    } else {
+                        round_stroke(t)
+                    };
+                    pixmap.stroke_path(&path, &paint, &stroke, tf, None);
+                }
             }
             let mut tri = PathBuilder::new();
             tri.move_to(to.x, to.y);
@@ -456,10 +471,14 @@ fn draw_arrow(
             }
         }
         ArrowHead::Tapered => {
-            // One closed filled shape: a thin tail widening into the head.
-            // Base proportions (scaled down for short arrows by `k`):
-            //   head length ~3.5*t (min 12px), head base half-width 2*t,
-            //   shaft neck half-width 0.8*t, tail half-width 0.25*t.
+            // One closed filled shape: a rounded tail cap fading into a
+            // gently-curved shaft, widening at a filleted shoulder into the
+            // head, easing to a nearly-sharp tip. Base proportions (scaled
+            // down for short arrows by `k`): head length ~3.5*t (min 12px),
+            // head base half-width 2*t, shaft neck half-width 0.8*t, tail
+            // half-width 0.25*t — unchanged from before; only the corners
+            // and edges are softened, so the silhouette never grows past the
+            // old sharp-cornered bounds (see `annotation_bounds`).
             let base_head_len = (t * 3.5).max(12.0);
             let head_len = base_head_len.min(len * 0.6); // never > 60% of length
             let k = (head_len / base_head_len).clamp(0.0, 1.0);
@@ -467,22 +486,101 @@ fn draw_arrow(
             let neck_half = 0.8 * t * k;
             let head_half = 2.0 * t * k;
 
-            // Neck = where the shaft meets the head base.
+            // Neck = where the shaft meets the head base (axial position).
             let nx = to.x - ux * head_len;
             let ny = to.y - uy * head_len;
 
+            // Fillet reach at the shoulder (neck_l/neck_r — a re-entrant
+            // corner, since the head base is wider than the shaft) and at
+            // the wing-back corner (head_l/head_r — convex). Both are
+            // clamped so together they never overrun the short straight
+            // step between neck_half and head_half.
+            let step = (head_half - neck_half).max(0.0);
+            let mut r_neck = 0.35 * step;
+            let mut r_wing = (0.15 * head_len).min(head_half * 0.6);
+            let reach = r_neck + r_wing;
+            if reach > step && reach > 1e-6 {
+                let s = step / reach;
+                r_neck *= s;
+                r_wing *= s;
+            }
+            // Tiny tip ease: keeps the point reading sharp, just not a
+            // razor-thin spike.
+            let r_tip = (0.08 * t).clamp(0.3, 1.0);
+
+            let tail_l = (from.x + px * tail_half, from.y + py * tail_half);
+            let tail_r = (from.x - px * tail_half, from.y - py * tail_half);
+            let neck_l = (nx + px * neck_half, ny + py * neck_half);
+            let neck_r = (nx - px * neck_half, ny - py * neck_half);
+            let head_l = (nx + px * head_half, ny + py * head_half);
+            let head_r = (nx - px * head_half, ny - py * head_half);
+
+            let dist = |a: (f32, f32), b: (f32, f32)| -> f32 {
+                ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+            };
+            let norm = |dx: f32, dy: f32| -> (f32, f32) {
+                let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+                (dx / l, dy / l)
+            };
+            let (tnl_x, tnl_y) = norm(neck_l.0 - tail_l.0, neck_l.1 - tail_l.1);
+            let (tnr_x, tnr_y) = norm(neck_r.0 - tail_r.0, neck_r.1 - tail_r.1);
+            let (htl_x, htl_y) = norm(to.x - head_l.0, to.y - head_l.1);
+            let (htr_x, htr_y) = norm(to.x - head_r.0, to.y - head_r.1);
+
+            let r_neck = r_neck.min(dist(tail_l, neck_l) * 0.9).min(dist(tail_r, neck_r) * 0.9);
+
+            let neck_in_l = (neck_l.0 - tnl_x * r_neck, neck_l.1 - tnl_y * r_neck);
+            let neck_out_l = (neck_l.0 + px * r_neck, neck_l.1 + py * r_neck);
+            let neck_in_r = (neck_r.0 - tnr_x * r_neck, neck_r.1 - tnr_y * r_neck);
+            let neck_out_r = (neck_r.0 - px * r_neck, neck_r.1 - py * r_neck);
+
+            let head_in_l = (head_l.0 - px * r_wing, head_l.1 - py * r_wing);
+            let head_out_l = (head_l.0 + htl_x * r_wing, head_l.1 + htl_y * r_wing);
+            let head_in_r = (head_r.0 + px * r_wing, head_r.1 + py * r_wing);
+            let head_out_r = (head_r.0 + htr_x * r_wing, head_r.1 + htr_y * r_wing);
+
+            let r_tip_l = r_tip.min(dist(head_l, (to.x, to.y)) * 0.3);
+            let r_tip_r = r_tip.min(dist(head_r, (to.x, to.y)) * 0.3);
+            let tip_in_l = (to.x - htl_x * r_tip_l, to.y - htl_y * r_tip_l);
+            let tip_in_r = (to.x - htr_x * r_tip_r, to.y - htr_y * r_tip_r);
+
+            // Shaft edges ease very slightly toward the centerline (a soft
+            // concave bow rather than a razor-straight wedge side): the quad
+            // control point is the straight-edge midpoint, pulled 12% of the
+            // way toward its projection onto the from->to axis.
+            let ease = |a: (f32, f32), b: (f32, f32)| -> (f32, f32) {
+                let mid = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+                let tproj = (mid.0 - from.x) * ux + (mid.1 - from.y) * uy;
+                let proj = (from.x + ux * tproj, from.y + uy * tproj);
+                (mid.0 + (proj.0 - mid.0) * 0.12, mid.1 + (proj.1 - mid.1) * 0.12)
+            };
+            let ctrl_l = ease(tail_l, neck_in_l);
+            let ctrl_r = ease(tail_r, neck_in_r);
+
             let mut pb = PathBuilder::new();
-            // Left tail edge -> left neck edge -> left head wing ->
-            // tip -> right head wing -> right neck edge -> right tail edge.
-            pb.move_to(from.x + px * tail_half, from.y + py * tail_half);
-            pb.line_to(nx + px * neck_half, ny + py * neck_half);
-            pb.line_to(nx + px * head_half, ny + py * head_half);
-            pb.line_to(to.x, to.y); // sharp tip, exactly at `to`
-            pb.line_to(nx - px * head_half, ny - py * head_half);
-            pb.line_to(nx - px * neck_half, ny - py * neck_half);
-            pb.line_to(from.x - px * tail_half, from.y - py * tail_half);
+            pb.move_to(tail_l.0, tail_l.1);
+            pb.quad_to(ctrl_l.0, ctrl_l.1, neck_in_l.0, neck_in_l.1);
+            pb.quad_to(neck_l.0, neck_l.1, neck_out_l.0, neck_out_l.1);
+            pb.line_to(head_in_l.0, head_in_l.1);
+            pb.quad_to(head_l.0, head_l.1, head_out_l.0, head_out_l.1);
+            pb.line_to(tip_in_l.0, tip_in_l.1);
+            pb.quad_to(to.x, to.y, tip_in_r.0, tip_in_r.1); // sharp tip, eased
+            pb.line_to(head_out_r.0, head_out_r.1);
+            pb.quad_to(head_r.0, head_r.1, head_in_r.0, head_in_r.1);
+            pb.line_to(neck_out_r.0, neck_out_r.1);
+            pb.quad_to(neck_r.0, neck_r.1, neck_in_r.0, neck_in_r.1);
+            pb.quad_to(ctrl_r.0, ctrl_r.1, tail_r.0, tail_r.1);
             pb.close();
             if let Some(path) = pb.finish() {
+                pixmap.fill_path(&path, &paint, FillRule::Winding, tf, None);
+            }
+            // Rounded tail cap: a small circle at `from` (radius tail_half)
+            // drawn as its own fill, so the outline above can stay a plain
+            // straight closing edge at the tail without needing to match
+            // this circle's winding direction.
+            if tail_half > 0.05
+                && let Some(path) = PathBuilder::from_circle(from.x, from.y, tail_half)
+            {
                 pixmap.fill_path(&path, &paint, FillRule::Winding, tf, None);
             }
         }
