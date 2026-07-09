@@ -1,0 +1,4 @@
+# Statically link the MSVC C runtime so skrino.exe is fully self-contained:
+# a bare Windows install without the VC++ Redistributable can run it as-is.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
