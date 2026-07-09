@@ -20,6 +20,8 @@ pub enum ToastAction {
     OpenUrl(String),
     /// Re-run the last share attempt.
     Retry,
+    /// Reveal this file in the system file manager (Explorer /select).
+    RevealFile(std::path::PathBuf),
 }
 
 struct Toast {
@@ -61,6 +63,11 @@ impl Toasts {
     /// A clickable error toast that retries the last action when clicked.
     pub fn error_retry(&mut self, msg: impl Into<String>) {
         self.push(msg.into(), ToastKind::Error, 10.0, ToastAction::Retry);
+    }
+
+    /// A clickable success toast that reveals `path` in Explorer when clicked.
+    pub fn saved(&mut self, msg: impl Into<String>, path: std::path::PathBuf) {
+        self.push(msg.into(), ToastKind::Success, 8.0, ToastAction::RevealFile(path));
     }
 
     fn push(&mut self, message: String, kind: ToastKind, duration: f32, action: ToastAction) {
@@ -143,10 +150,15 @@ impl Toasts {
                                         .color(alpha_col(palette.text, alpha))
                                         .font(FontId::proportional(14.0)),
                                 );
-                                if matches!(toast.action, ToastAction::Retry) {
+                                let hint = match toast.action {
+                                    ToastAction::Retry => Some("Повторить"),
+                                    ToastAction::RevealFile(_) => Some("Открыть папку"),
+                                    _ => None,
+                                };
+                                if let Some(hint) = hint {
                                     ui.add_space(6.0);
                                     ui.label(
-                                        RichText::new("Повторить")
+                                        RichText::new(hint)
                                             .color(alpha_col(accent, alpha))
                                             .font(FontId::proportional(13.0)),
                                     );

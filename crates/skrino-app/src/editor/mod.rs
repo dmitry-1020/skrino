@@ -158,7 +158,6 @@ impl EditorState {
         &mut self,
         ctx: &egui::Context,
         palette: &Palette,
-        upload_configured: bool,
         sharing: bool,
     ) -> EditorSignal {
         self.ensure_texture(ctx);
@@ -175,7 +174,7 @@ impl EditorState {
         egui::TopBottomPanel::bottom("skrino_bottom")
             .exact_height(52.0)
             .show(ctx, |ui| {
-                if let Some(s) = toolbar::bottom_bar(self, ui, palette, upload_configured, sharing) {
+                if let Some(s) = toolbar::bottom_bar(self, ui, palette, sharing) {
                     signal = s;
                 }
             });

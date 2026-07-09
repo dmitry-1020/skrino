@@ -31,6 +31,23 @@ impl ImageFormat {
     }
 }
 
+/// Where the editor's «Поделиться» button sends the rendered screenshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShareDestination {
+    /// Save into a local folder (no network); default `Pictures\Skrino`.
+    LocalDir { path: PathBuf },
+    /// Upload to the configured FTP/SFTP server.
+    Server,
+}
+
+impl Default for ShareDestination {
+    fn default() -> Self {
+        ShareDestination::LocalDir {
+            path: AppConfig::fallback_dir(),
+        }
+    }
+}
+
 /// Upload settings as edited in the UI. Converted to
 /// [`skrino_upload::UploadConfig`] (with the secret pulled from the keychain)
 /// only when an actual transfer runs.
@@ -120,6 +137,9 @@ pub struct AppConfig {
     /// Last directory used in the Save dialog (remembered between sessions).
     pub last_save_dir: Option<PathBuf>,
     pub upload: UploadSettings,
+    /// Destination for the editor's «Поделиться» action.
+    #[serde(default)]
+    pub share_dest: ShareDestination,
     /// Set once the user has completed first-run setup.
     pub configured: bool,
 }
@@ -134,6 +154,7 @@ impl Default for AppConfig {
             autostart: false,
             last_save_dir: None,
             upload: UploadSettings::default(),
+            share_dest: ShareDestination::default(),
             configured: false,
         }
     }
@@ -275,7 +296,16 @@ mod tests {
         cfg.upload.protocol = Protocol::Ftps;
         cfg.upload.url_template = "https://example.com/s/{filename}".into();
         cfg.upload.has_password = true;
+        cfg.share_dest = ShareDestination::LocalDir {
+            path: PathBuf::from("C:/shots/shared"),
+        };
 
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(cfg, back);
+
+        // Server variant round-trips too.
+        cfg.share_dest = ShareDestination::Server;
         let text = serde_json::to_string_pretty(&cfg).unwrap();
         let back: AppConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(cfg, back);
@@ -286,6 +316,23 @@ mod tests {
         // Forward/backward compatible: an empty object yields all defaults.
         let back: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(back, AppConfig::default());
+    }
+
+    #[test]
+    fn old_config_without_share_dest_defaults_to_local_dir() {
+        // A config.json written by an earlier version has no `share_dest` key.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "last_save_dir": null,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(back.share_dest, ShareDestination::LocalDir { .. }));
+        assert!(back.configured);
     }
 
     #[test]

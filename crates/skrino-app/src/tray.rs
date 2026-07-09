@@ -19,6 +19,7 @@ pub enum TrayCommand {
 
 pub struct Tray {
     _tray: TrayIcon,
+    region: MenuItem,
     id_region: MenuId,
     id_full: MenuId,
     id_open: MenuId,
@@ -27,8 +28,13 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new() -> Result<Self, String> {
-        let region = MenuItem::new("Скриншот области  (PrtScr)", true, None);
+    pub fn new(hotkey: &str) -> Result<Self, String> {
+        let region_label = if hotkey.trim().is_empty() {
+            "Скриншот области".to_string()
+        } else {
+            format!("Скриншот области  ({hotkey})")
+        };
+        let region = MenuItem::new(region_label, true, None);
         let full = MenuItem::new("Скриншот всего экрана", true, None);
         let open = MenuItem::new("Открыть файл…", true, None);
         let settings = MenuItem::new("Настройки", true, None);
@@ -51,13 +57,24 @@ impl Tray {
             .map_err(|e| e.to_string())?;
 
         Ok(Self {
-            _tray: tray,
             id_region: region.id().clone(),
             id_full: full.id().clone(),
             id_open: open.id().clone(),
             id_settings: settings.id().clone(),
             id_quit: quit.id().clone(),
+            region,
+            _tray: tray,
         })
+    }
+
+    /// Update the region menu item to show the current hotkey.
+    pub fn set_region_hotkey(&self, hotkey: &str) {
+        let label = if hotkey.trim().is_empty() {
+            "Скриншот области".to_string()
+        } else {
+            format!("Скриншот области  ({hotkey})")
+        };
+        self.region.set_text(label);
     }
 
     /// Map an incoming menu-event id to a command.

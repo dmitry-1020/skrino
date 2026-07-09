@@ -1,47 +1,67 @@
-//! Region-selection overlay: a borderless, always-on-top viewport that shows the
-//! frozen screenshot dimmed, with a live drag-selection punched through at full
+//! Region-selection overlay. The frozen screenshot is drawn dimmed across the
+//! whole ROOT window, with a live drag-selection punched through at full
 //! brightness.
+//!
+//! ARCHITECTURE
+//! ------------
+//! The overlay is drawn into the **root** viewport's `CentralPanel` — it is NOT a
+//! child/immediate viewport. The app transforms the root window into a
+//! borderless, always-on-top surface covering the target monitor (see
+//! `app.rs`), then this module renders the selection UI into it. Rendering in the
+//! root avoids the previous freeze, where an immediate child viewport never
+//! painted because the (hidden) root stopped receiving redraws.
 //!
 //! COORDINATE MODEL
 //! ----------------
-//! `capture.image` is in physical pixels; `origin_x/origin_y` are the
-//! virtual-screen physical coordinates of image pixel (0,0). The overlay
-//! viewport is placed so its top-left coincides with that image origin, and its
-//! logical size is `image_size / scale`. egui then reports pointer positions in
-//! logical points relative to the viewport top-left, so a point maps to a
-//! physical image pixel by multiplying by `scale` (see
-//! [`crate::transform::OverlayTransform`]).
+//! `image` is the target monitor's slice of the virtual-screen capture, in
+//! physical pixels. The overlay window covers exactly that monitor, so egui
+//! reports pointer positions in logical points relative to the window's
+//! top-left; a point maps to a physical image pixel by multiplying by `scale`
+//! (see [`crate::transform::OverlayTransform`]). The monitor's offset within the
+//! virtual screen is already baked into `image` by cropping in `app.rs`, so a
+//! single scale suffices here and the transform tests are unchanged.
 //!
-//! v1 CAVEAT: a single `scale` is used for the whole span. On a multi-monitor
-//! setup with mixed DPI the mapping is exact only on monitors sharing the chosen
-//! scale (the primary's). Cross-DPI refinement is left to the integrator.
+//! FAILSAFES (never wedge the screen again)
+//! ----------------------------------------
+//! * Esc cancels.
+//! * Right-click cancels.
+//! * Auto-cancel after [`MAX_OVERLAY_SECS`] regardless of input.
+//! * `--overlay-smoke` mode auto-cancels after [`SMOKE_SECS`] for safe testing.
+
+use std::time::Instant;
 
 use egui::{
     Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Vec2, ViewportBuilder, ViewportId,
+    TextureOptions, Vec2,
 };
 use image::RgbaImage;
-use skrino_capture::VirtualScreenCapture;
 
 use crate::theme::Palette;
 use crate::transform::OverlayTransform;
+
+/// Hard safety cap: an overlay left up this long auto-cancels so a stuck
+/// fullscreen surface can never require a reboot.
+const MAX_OVERLAY_SECS: f32 = 120.0;
+/// Smoke-test auto-cancel delay (`--overlay-smoke`).
+const SMOKE_SECS: f32 = 3.0;
 
 /// What the overlay produced this frame.
 pub enum OverlayOutcome {
     /// Still selecting.
     Pending,
-    /// User pressed Esc / dismissed.
+    /// User pressed Esc / right-clicked / timed out.
     Cancelled,
     /// Confirmed; the cropped physical-pixel image is ready for the editor.
     Confirmed(RgbaImage),
 }
 
 pub struct OverlayState {
-    capture: VirtualScreenCapture,
+    /// Target monitor's portion of the capture, physical pixels.
+    image: RgbaImage,
     transform: OverlayTransform,
-    /// Logical position (points) of the viewport top-left.
-    origin_pt: Pos2,
-    /// Logical size (points) of the overlay.
+    /// Desired root-window outer position (logical points).
+    pos_pt: Pos2,
+    /// Desired root-window inner size (logical points).
     size_pt: Vec2,
     texture: Option<TextureHandle>,
     /// Selection anchor / current, in overlay-local logical points.
@@ -51,91 +71,88 @@ pub struct OverlayState {
     dragging: bool,
     /// Finalised selection awaiting confirm (Enter / ОК / double-click).
     committed: Option<Rect>,
+    /// When the overlay became active (for time-based failsafes).
+    started: Instant,
+    /// Smoke-test mode: auto-cancel after [`SMOKE_SECS`].
+    smoke: bool,
 }
 
 impl OverlayState {
-    pub fn new(capture: VirtualScreenCapture) -> Self {
-        // Choose the effective scale: the primary monitor's, falling back to the
-        // first monitor or 1.0.
-        let scale = capture
-            .monitors
-            .iter()
-            .find(|m| m.is_primary)
-            .or_else(|| capture.monitors.first())
-            .map(|m| m.scale_factor)
-            .filter(|s| *s > 0.0)
-            .unwrap_or(1.0);
-
-        let (w, h) = (capture.image.width(), capture.image.height());
-        let transform = OverlayTransform::new(scale, w, h);
-        let origin_pt = Pos2::new(
-            capture.origin_x as f32 / scale,
-            capture.origin_y as f32 / scale,
-        );
-        let size_pt = Vec2::new(w as f32 / scale, h as f32 / scale);
-
+    /// `image` is the monitor slice; `scale` its DPI scale; `pos_pt`/`size_pt`
+    /// the root-window geometry (logical points) the app should apply.
+    pub fn new(image: RgbaImage, scale: f32, pos_pt: Pos2, size_pt: Vec2, smoke: bool) -> Self {
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let (w, h) = (image.width(), image.height());
         Self {
-            capture,
-            transform,
-            origin_pt,
+            transform: OverlayTransform::new(scale, w, h),
+            image,
+            pos_pt,
             size_pt,
             texture: None,
             drag_start: None,
             drag_cur: None,
             dragging: false,
             committed: None,
+            started: Instant::now(),
+            smoke,
         }
     }
 
-    /// Render the overlay in its own immediate viewport and return the outcome.
-    pub fn run(&mut self, ctx: &egui::Context, palette: &Palette) -> OverlayOutcome {
-        let builder = ViewportBuilder::default()
-            .with_title("Skrino — выделение")
-            .with_position(self.origin_pt)
-            .with_inner_size(self.size_pt)
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_always_on_top();
+    /// Desired root-window outer position (logical points).
+    pub fn window_pos(&self) -> Pos2 {
+        self.pos_pt
+    }
 
-        let vid = ViewportId::from_hash_of("skrino_overlay");
-        
-        ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
-            self.ui(ctx, palette)
-        })
+    /// Desired root-window inner size (logical points).
+    pub fn window_size(&self) -> Vec2 {
+        self.size_pt
+    }
+
+    /// Draw the overlay into the root viewport and return the outcome. Requests a
+    /// repaint every frame so input keeps flowing without any external heartbeat.
+    pub fn run(&mut self, ctx: &egui::Context, palette: &Palette) -> OverlayOutcome {
+        ctx.request_repaint();
+        self.ui(ctx, palette)
     }
 
     fn ensure_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
         if self.texture.is_none() {
-            let size = [
-                self.capture.image.width() as usize,
-                self.capture.image.height() as usize,
-            ];
-            let color = egui::ColorImage::from_rgba_unmultiplied(size, self.capture.image.as_raw());
-            self.texture = Some(ctx.load_texture("skrino_overlay_tex", color, TextureOptions::LINEAR));
+            let size = [self.image.width() as usize, self.image.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, self.image.as_raw());
+            self.texture =
+                Some(ctx.load_texture("skrino_overlay_tex", color, TextureOptions::LINEAR));
         }
-        // Safe: just populated above.
         self.texture.as_ref().unwrap().id()
     }
 
     fn ui(&mut self, ctx: &egui::Context, palette: &Palette) -> OverlayOutcome {
+        // Time-based failsafes first: these fire even if input is somehow lost.
+        let elapsed = self.started.elapsed().as_secs_f32();
+        if self.smoke && elapsed >= SMOKE_SECS {
+            return OverlayOutcome::Cancelled;
+        }
+        if elapsed >= MAX_OVERLAY_SECS {
+            log::warn!("overlay auto-cancelled after {MAX_OVERLAY_SECS}s failsafe");
+            return OverlayOutcome::Cancelled;
+        }
+
         let tex_id = self.ensure_texture(ctx);
         let mut result = OverlayOutcome::Pending;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
+            .frame(egui::Frame::NONE.fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let full = ui.max_rect();
                 let painter = ui.painter_at(full);
                 let resp = ui.interact(full, ui.id().with("overlay_area"), Sense::click_and_drag());
 
                 // --- input ---
-                let (esc, enter, dbl) = ctx.input(|i| {
+                let (esc, enter, dbl, secondary) = ctx.input(|i| {
                     (
                         i.key_pressed(egui::Key::Escape),
                         i.key_pressed(egui::Key::Enter),
                         i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                        i.pointer.button_clicked(egui::PointerButton::Secondary),
                     )
                 });
 
@@ -206,7 +223,12 @@ impl OverlayState {
 
                 // Hint at top-centre.
                 let hint_pos = Pos2::new(full.center().x, full.min.y + 22.0);
-                draw_hint(&painter, hint_pos, "Выделите область  •  Esc — отмена", palette);
+                draw_hint(
+                    &painter,
+                    hint_pos,
+                    "Выделите область  •  Esc или правый клик — отмена",
+                    palette,
+                );
 
                 // "ОК" button once a selection is committed.
                 if let Some(sel) = self.committed {
@@ -218,11 +240,9 @@ impl OverlayState {
                     let btn_rect = Rect::from_min_size(btn_pos, btn_size);
                     let ok = ui.put(
                         btn_rect,
-                        egui::Button::new(
-                            egui::RichText::new("ОК").color(Color32::WHITE).strong(),
-                        )
-                        .fill(palette.accent)
-                        .corner_radius(CornerRadius::same(8)),
+                        egui::Button::new(egui::RichText::new("ОК").color(Color32::WHITE).strong())
+                            .fill(palette.accent)
+                            .corner_radius(CornerRadius::same(8)),
                     );
                     if ok.clicked() {
                         result = self.confirm();
@@ -230,10 +250,9 @@ impl OverlayState {
                 }
 
                 // --- keyboard / gesture confirm & cancel ---
-                if esc {
+                if esc || secondary {
                     result = OverlayOutcome::Cancelled;
                 } else if (enter || dbl) && self.current_selection().is_some() {
-                    // Promote a live drag to committed if needed, then confirm.
                     if self.committed.is_none() {
                         self.committed = self.current_selection();
                     }
@@ -250,12 +269,13 @@ impl OverlayState {
             return Some(c);
         }
         if self.dragging
-            && let (Some(a), Some(b)) = (self.drag_start, self.drag_cur) {
-                let r = Rect::from_two_pos(a, b);
-                if r.width() >= 1.0 && r.height() >= 1.0 {
-                    return Some(r);
-                }
+            && let (Some(a), Some(b)) = (self.drag_start, self.drag_cur)
+        {
+            let r = Rect::from_two_pos(a, b);
+            if r.width() >= 1.0 && r.height() >= 1.0 {
+                return Some(r);
             }
+        }
         None
     }
 
@@ -267,7 +287,7 @@ impl OverlayState {
         if w == 0 || h == 0 {
             return OverlayOutcome::Cancelled;
         }
-        let cropped = image::imageops::crop_imm(&self.capture.image, x, y, w, h).to_image();
+        let cropped = image::imageops::crop_imm(&self.image, x, y, w, h).to_image();
         OverlayOutcome::Confirmed(cropped)
     }
 }

@@ -100,7 +100,6 @@ pub fn bottom_bar(
     state: &mut EditorState,
     ui: &mut egui::Ui,
     palette: &Palette,
-    upload_configured: bool,
     sharing: bool,
 ) -> Option<EditorSignal> {
     let mut signal = None;
@@ -128,8 +127,9 @@ pub fn bottom_bar(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(6.0);
 
-            // Поделиться (primary accent).
-            let share_enabled = upload_configured && !sharing;
+            // Поделиться (primary accent). Never disabled: the default
+            // destination is a local folder, so it always does something.
+            let share_enabled = !sharing;
             let share_label = if sharing {
                 format!("{}  Отправка…", ph::SPINNER)
             } else {
@@ -143,9 +143,7 @@ pub fn bottom_bar(
                 })
                 .corner_radius(CornerRadius::same(8));
             let mut resp = ui.add_enabled(share_enabled, share_btn);
-            if !upload_configured {
-                resp = resp.on_hover_text("Настройте загрузку в параметрах, чтобы делиться ссылкой");
-            } else if sharing {
+            if sharing {
                 resp = resp.on_hover_text("Идёт отправка…");
             }
             if resp.clicked() {

@@ -4830,6 +4830,7 @@ dependencies = [
  "tray-icon",
  "webbrowser",
  "winapi",
+ "winit",
  "winreg",
  "winres",
 ]

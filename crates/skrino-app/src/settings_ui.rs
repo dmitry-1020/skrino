@@ -6,7 +6,7 @@ use std::sync::mpsc::Receiver;
 use egui::{ComboBox, RichText};
 use skrino_upload::{Protocol, UploadConfig};
 
-use crate::config::{AppConfig, ImageFormat};
+use crate::config::{AppConfig, ImageFormat, ShareDestination};
 use crate::theme::{Palette, Theme};
 
 /// What the app should act on after the settings window ran this frame.
@@ -59,7 +59,7 @@ impl SettingsWindow {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
-                    self.upload_section(ui, cfg, palette);
+                    self.share_section(ui, cfg, palette);
                     ui.add_space(10.0);
                     self.general_section(ui, cfg, palette);
                 });
@@ -74,6 +74,47 @@ impl SettingsWindow {
         result.autostart_changed = cfg.autostart != old_autostart;
         result.dirty = *cfg != before || result.close;
         result
+    }
+
+    /// «Поделиться»: choose a local folder or the FTP/SFTP server. When the
+    /// server is chosen, the upload credentials appear below.
+    fn share_section(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, palette: &Palette) {
+        section_header(ui, palette, "Поделиться");
+
+        let is_local = matches!(cfg.share_dest, ShareDestination::LocalDir { .. });
+        if ui.radio(is_local, "В локальную папку").clicked() && !is_local {
+            cfg.share_dest = ShareDestination::LocalDir {
+                path: AppConfig::fallback_dir(),
+            };
+        }
+        if let ShareDestination::LocalDir { path } = &mut cfg.share_dest {
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                if ui.button("Выбрать папку…").clicked()
+                    && let Some(dir) = rfd::FileDialog::new()
+                        .set_title("Папка для сохранения при «Поделиться»")
+                        .set_directory(&*path)
+                        .pick_folder()
+                {
+                    *path = dir;
+                }
+                ui.label(
+                    RichText::new(path.display().to_string())
+                        .size(12.0)
+                        .color(palette.text_secondary),
+                );
+            });
+        }
+
+        let is_server = matches!(cfg.share_dest, ShareDestination::Server);
+        if ui.radio(is_server, "На сервер (FTP/SFTP)").clicked() && !is_server {
+            cfg.share_dest = ShareDestination::Server;
+        }
+
+        if is_server {
+            ui.add_space(8.0);
+            self.upload_section(ui, cfg, palette);
+        }
     }
 
     fn upload_section(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, palette: &Palette) {

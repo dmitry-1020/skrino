@@ -24,6 +24,8 @@ egui = "0.33"
 
 global-hotkey = "0.7"
 tray-icon = "0.21"
+# Windowless event loop for the tray daemon (matches eframe 0.33's winit).
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 # Clipboard with image support
 arboard = { version = "3", features = ["image-data"] }
 # Native save/open dialogs
@@ -36,7 +38,18 @@ webbrowser = "1"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-winapi = { version = "0.3", features = ["winuser"] }
+winapi = { version = "0.3", features = [
+    "winuser",
+    "windef",
+    "synchapi",
+    "handleapi",
+    "errhandlingapi",
+    "processthreadsapi",
+    "winbase",
+    "winnt",
+    "winerror",
+    "minwindef",
+] }
 winreg = "0.55"
 
 [target.'cfg(windows)'.build-dependencies]

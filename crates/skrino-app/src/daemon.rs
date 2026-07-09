@@ -1,0 +1,305 @@
+//! Tray daemon (`skrino --tray`): a minimal background process that owns the
+//! system-tray icon and the global hotkey. It runs a **winit** event loop with
+//! NO window and NO eframe/egui/GPU, so idle memory stays tiny.
+//!
+//! Zero idle polling: `ControlFlow::Wait` parks the loop until something happens.
+//! `tray-icon` and `global-hotkey` deliver their events through global handlers
+//! that forward to an [`EventLoopProxy`], waking the loop only on real events.
+//!
+//! Every action just spawns a fresh UI process (`std::env::current_exe()` with a
+//! flag) and detaches — the daemon never draws anything itself.
+//!
+//! Single instance: a named Win32 mutex (`Global\skrino-tray`). A second daemon
+//! exits silently. Hotkey reload: the settings UI process signals a named event
+//! (`Global\skrino-tray-reload`); a blocked helper thread wakes and asks the
+//! loop to re-read the config — no process killing, no polling.
+
+use winit::application::ApplicationHandler;
+use winit::event::{StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::WindowId;
+
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+use tray_icon::menu::{MenuEvent, MenuId};
+
+use crate::config::AppConfig;
+use crate::hotkey::HotkeyRegistration;
+use crate::tray::{Tray, TrayCommand};
+
+/// Wake reasons delivered to the event loop.
+#[derive(Debug)]
+enum UserEvent {
+    Menu(MenuId),
+    Hotkey(u32),
+    ReloadConfig,
+}
+
+struct Daemon {
+    tray: Option<Tray>,
+    hotkeys: Option<HotkeyRegistration>,
+    hotkey_id: Option<u32>,
+    initialized: bool,
+}
+
+impl Daemon {
+    fn spawn_ui(&self, flag: &str) {
+        if let Ok(exe) = std::env::current_exe() {
+            match std::process::Command::new(exe).arg(flag).spawn() {
+                Ok(_child) => {} // detached; we never wait on it
+                Err(e) => log::error!("failed to spawn UI ({flag}): {e}"),
+            }
+        }
+    }
+
+    fn init(&mut self) {
+        let config = AppConfig::load();
+        match Tray::new(&config.hotkey) {
+            Ok(t) => self.tray = Some(t),
+            Err(e) => log::error!("tray init failed: {e}"),
+        }
+        let mut hk = match HotkeyRegistration::new() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::error!("hotkey manager init failed: {e}");
+                None
+            }
+        };
+        if let Some(h) = &mut hk
+            && let Err(e) = h.set(&config.hotkey)
+        {
+            log::warn!("hotkey register failed: {e}");
+        }
+        self.hotkey_id = hk.as_ref().and_then(|h| h.current_id());
+        self.hotkeys = hk;
+    }
+
+    /// Re-read the config and re-register the hotkey (after a settings change).
+    fn reload(&mut self) {
+        let config = AppConfig::load();
+        if let Some(h) = &mut self.hotkeys {
+            match h.set(&config.hotkey) {
+                Ok(()) => self.hotkey_id = h.current_id(),
+                Err(e) => log::warn!("hotkey re-register failed: {e}"),
+            }
+        }
+        if let Some(t) = &self.tray {
+            t.set_region_hotkey(&config.hotkey);
+        }
+        log::info!("daemon reloaded config (hotkey: {})", config.hotkey);
+    }
+}
+
+impl ApplicationHandler<UserEvent> for Daemon {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::Init) && !self.initialized {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            self.init();
+            self.initialized = true;
+        }
+    }
+
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn window_event(&mut self, _e: &ActiveEventLoop, _id: WindowId, _ev: WindowEvent) {}
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Menu(id) => {
+                let cmd = self.tray.as_ref().and_then(|t| t.command_for(&id));
+                match cmd {
+                    Some(TrayCommand::CaptureRegion) => self.spawn_ui("--capture-region"),
+                    Some(TrayCommand::CaptureFull) => self.spawn_ui("--capture-full"),
+                    Some(TrayCommand::OpenFile) => self.spawn_ui("--open-file"),
+                    Some(TrayCommand::Settings) => self.spawn_ui("--settings"),
+                    Some(TrayCommand::Quit) => {
+                        remove_pidfile();
+                        event_loop.exit();
+                    }
+                    None => {}
+                }
+            }
+            UserEvent::Hotkey(id) => {
+                if Some(id) == self.hotkey_id {
+                    self.spawn_ui("--capture-region");
+                }
+            }
+            UserEvent::ReloadConfig => self.reload(),
+        }
+    }
+}
+
+/// Entry point for `skrino --tray`.
+pub fn run() {
+    if !acquire_single_instance() {
+        log::info!("another skrino tray daemon is already running; exiting");
+        return;
+    }
+    write_pidfile();
+
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(el) => el,
+        Err(e) => {
+            log::error!("failed to build event loop: {e}");
+            return;
+        }
+    };
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+
+    // Route tray-menu and global-hotkey events into the loop (wakes on demand).
+    let menu_proxy = proxy.clone();
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        let _ = menu_proxy.send_event(UserEvent::Menu(e.id));
+    }));
+    let hk_proxy = proxy.clone();
+    GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+        if e.state == HotKeyState::Pressed {
+            let _ = hk_proxy.send_event(UserEvent::Hotkey(e.id));
+        }
+    }));
+
+    // Blocked helper thread: wakes only when the settings process signals the
+    // reload event, then asks the loop to re-read the config.
+    spawn_reload_watcher(proxy);
+
+    let mut app = Daemon {
+        tray: None,
+        hotkeys: None,
+        hotkey_id: None,
+        initialized: false,
+    };
+    if let Err(e) = event_loop.run_app(&mut app) {
+        log::error!("tray event loop error: {e}");
+    }
+    remove_pidfile();
+}
+
+/// Called by the settings UI process after saving a hotkey change: signal a
+/// running daemon (if any) to reload. No-op when no daemon is running.
+pub fn reload_if_running() {
+    signal_reload();
+}
+
+// ============================ Windows plumbing ============================
+
+#[cfg(windows)]
+const MUTEX_NAME: &str = "Global\\skrino-tray";
+#[cfg(windows)]
+const RELOAD_EVENT_NAME: &str = "Global\\skrino-tray-reload";
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Acquire the single-instance mutex. Returns false if another daemon owns it.
+#[cfg(windows)]
+fn acquire_single_instance() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::synchapi::CreateMutexW;
+
+    // Held for the whole process lifetime (released automatically on exit).
+    static MUTEX_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+    let name = wide(MUTEX_NAME);
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr());
+        if handle.is_null() {
+            // Could not create the mutex; err on the side of running.
+            return true;
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        MUTEX_HANDLE.store(handle as usize, Ordering::SeqCst);
+    }
+    true
+}
+
+/// Spawn a thread that blocks on the reload event and forwards a wake.
+#[cfg(windows)]
+fn spawn_reload_watcher(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    use winapi::um::synchapi::{CreateEventW, WaitForSingleObject};
+    use winapi::um::winbase::WAIT_OBJECT_0;
+
+    let name = wide(RELOAD_EVENT_NAME);
+    // Auto-reset, initially non-signaled.
+    let handle = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, name.as_ptr()) };
+    if handle.is_null() {
+        log::warn!("could not create reload event; hotkey live-reload disabled");
+        return;
+    }
+    let handle_usize = handle as usize;
+    std::thread::Builder::new()
+        .name("skrino-reload-watch".into())
+        .spawn(move || {
+            let handle = handle_usize as winapi::um::winnt::HANDLE;
+            loop {
+                let r = unsafe { WaitForSingleObject(handle, winapi::um::winbase::INFINITE) };
+                if r != WAIT_OBJECT_0 {
+                    break;
+                }
+                if proxy.send_event(UserEvent::ReloadConfig).is_err() {
+                    break; // loop is gone
+                }
+            }
+        })
+        .ok();
+}
+
+/// Signal a running daemon to reload (open the named event and set it).
+#[cfg(windows)]
+fn signal_reload() {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::synchapi::{OpenEventW, SetEvent};
+    use winapi::um::winnt::EVENT_MODIFY_STATE;
+
+    let name = wide(RELOAD_EVENT_NAME);
+    unsafe {
+        let handle = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if handle.is_null() {
+            return; // no daemon running
+        }
+        SetEvent(handle);
+        CloseHandle(handle);
+    }
+}
+
+#[cfg(windows)]
+fn pidfile_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("skrino").join("tray.pid"))
+}
+
+#[cfg(windows)]
+fn write_pidfile() {
+    if let Some(path) = pidfile_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, std::process::id().to_string());
+    }
+}
+
+#[cfg(windows)]
+fn remove_pidfile() {
+    if let Some(path) = pidfile_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+// --- non-Windows stubs (the app targets Windows; keep it compiling elsewhere) ---
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> bool {
+    true
+}
+#[cfg(not(windows))]
+fn spawn_reload_watcher(_proxy: winit::event_loop::EventLoopProxy<UserEvent>) {}
+#[cfg(not(windows))]
+fn signal_reload() {}
+#[cfg(not(windows))]
+fn write_pidfile() {}
+#[cfg(not(windows))]
+fn remove_pidfile() {}
