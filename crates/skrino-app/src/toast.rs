@@ -12,7 +12,7 @@ pub enum ToastKind {
     Error,
 }
 
-/// What happens when the user clicks a toast card.
+/// What happens when the user clicks a toast button.
 #[derive(Clone)]
 pub enum ToastAction {
     None,
@@ -20,8 +20,16 @@ pub enum ToastAction {
     OpenUrl(String),
     /// Re-run the last share attempt.
     Retry,
+    /// Open the settings window (`--settings`), e.g. to fix bad credentials.
+    OpenSettings,
     /// Reveal this file in the system file manager (Explorer /select).
     RevealFile(std::path::PathBuf),
+}
+
+/// A labelled, clickable action rendered inside a toast card.
+struct ToastButton {
+    label: &'static str,
+    action: ToastAction,
 }
 
 struct Toast {
@@ -29,7 +37,7 @@ struct Toast {
     kind: ToastKind,
     created: f64,
     duration: f32,
-    action: ToastAction,
+    buttons: Vec<ToastButton>,
 }
 
 #[derive(Default)]
@@ -39,48 +47,89 @@ pub struct Toasts {
 
 impl Toasts {
     pub fn info(&mut self, msg: impl Into<String>) {
-        self.push(msg.into(), ToastKind::Info, 3.0, ToastAction::None);
+        self.push(msg.into(), ToastKind::Info, 3.0, Vec::new());
     }
 
     pub fn success(&mut self, msg: impl Into<String>) {
-        self.push(msg.into(), ToastKind::Success, 3.0, ToastAction::None);
+        self.push(msg.into(), ToastKind::Success, 3.0, Vec::new());
     }
 
     pub fn error(&mut self, msg: impl Into<String>) {
-        self.push(msg.into(), ToastKind::Error, 5.0, ToastAction::None);
+        self.push(msg.into(), ToastKind::Error, 5.0, Vec::new());
     }
 
-    /// A clickable success toast that opens `url` when clicked.
+    /// A success toast with an «Открыть» button that opens `url`.
     pub fn link(&mut self, msg: impl Into<String>, url: impl Into<String>) {
         self.push(
             msg.into(),
             ToastKind::Success,
             8.0,
-            ToastAction::OpenUrl(url.into()),
+            vec![ToastButton {
+                label: "Открыть",
+                action: ToastAction::OpenUrl(url.into()),
+            }],
         );
     }
 
-    /// A clickable error toast that retries the last action when clicked.
+    /// An error toast with a «Повторить» button that retries the last share.
     pub fn error_retry(&mut self, msg: impl Into<String>) {
-        self.push(msg.into(), ToastKind::Error, 10.0, ToastAction::Retry);
+        self.push(
+            msg.into(),
+            ToastKind::Error,
+            10.0,
+            vec![ToastButton {
+                label: "Повторить",
+                action: ToastAction::Retry,
+            }],
+        );
     }
 
-    /// A clickable success toast that reveals `path` in Explorer when clicked.
+    /// An auth-failure error toast: retry, plus «Открыть настройки» to fix the
+    /// broken credentials.
+    pub fn error_retry_auth(&mut self, msg: impl Into<String>) {
+        self.push(
+            msg.into(),
+            ToastKind::Error,
+            12.0,
+            vec![
+                ToastButton {
+                    label: "Повторить",
+                    action: ToastAction::Retry,
+                },
+                ToastButton {
+                    label: "Открыть настройки",
+                    action: ToastAction::OpenSettings,
+                },
+            ],
+        );
+    }
+
+    /// A success toast with an «Открыть папку» button that reveals `path`.
     pub fn saved(&mut self, msg: impl Into<String>, path: std::path::PathBuf) {
-        self.push(msg.into(), ToastKind::Success, 8.0, ToastAction::RevealFile(path));
+        self.push(
+            msg.into(),
+            ToastKind::Success,
+            8.0,
+            vec![ToastButton {
+                label: "Открыть папку",
+                action: ToastAction::RevealFile(path),
+            }],
+        );
     }
 
-    fn push(&mut self, message: String, kind: ToastKind, duration: f32, action: ToastAction) {
-        self.created_now(message, kind, duration, action);
-    }
-
-    fn created_now(&mut self, message: String, kind: ToastKind, duration: f32, action: ToastAction) {
+    fn push(
+        &mut self,
+        message: String,
+        kind: ToastKind,
+        duration: f32,
+        buttons: Vec<ToastButton>,
+    ) {
         self.items.push(Toast {
             message,
             kind,
             created: instant_seconds(),
             duration,
-            action,
+            buttons,
         });
         // Keep the stack short.
         while self.items.len() > 4 {
@@ -127,8 +176,6 @@ impl Toasts {
                             (palette.danger, egui_phosphor::regular::WARNING_CIRCLE)
                         }
                     };
-                    let clickable = !matches!(toast.action, ToastAction::None);
-
                     let frame = Frame::new()
                         .fill(alpha_col(palette.surface, alpha))
                         .stroke(Stroke::new(1.0, alpha_col(palette.border, alpha)))
@@ -136,47 +183,41 @@ impl Toasts {
                         .inner_margin(egui::Margin::symmetric(14, 10))
                         .outer_margin(egui::Margin::symmetric(0, 4));
 
-                    let resp = frame
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(icon)
-                                        .color(alpha_col(accent, alpha))
-                                        .font(FontId::proportional(18.0)),
-                                );
-                                ui.add_space(2.0);
-                                ui.label(
-                                    RichText::new(&toast.message)
-                                        .color(alpha_col(palette.text, alpha))
-                                        .font(FontId::proportional(14.0)),
-                                );
-                                let hint = match toast.action {
-                                    ToastAction::Retry => Some("Повторить"),
-                                    ToastAction::RevealFile(_) => Some("Открыть папку"),
-                                    _ => None,
-                                };
-                                if let Some(hint) = hint {
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new(hint)
-                                            .color(alpha_col(accent, alpha))
-                                            .font(FontId::proportional(13.0)),
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(icon)
+                                    .color(alpha_col(accent, alpha))
+                                    .font(FontId::proportional(18.0)),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(&toast.message)
+                                    .color(alpha_col(palette.text, alpha))
+                                    .font(FontId::proportional(14.0)),
+                            );
+                            // Action buttons: each is an individually clickable label.
+                            for button in &toast.buttons {
+                                ui.add_space(8.0);
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(button.label)
+                                                .color(alpha_col(accent, alpha))
+                                                .font(FontId::proportional(13.0)),
+                                        )
+                                        .sense(egui::Sense::click()),
                                     );
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
-                            });
-                        })
-                        .response;
-
-                    if clickable {
-                        let resp = resp.interact(egui::Sense::click());
-                        if resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if resp.clicked() {
-                            clicked = Some(toast.action.clone());
-                            consumed = Some(idx);
-                        }
-                    }
+                                if resp.clicked() {
+                                    clicked = Some(button.action.clone());
+                                    consumed = Some(idx);
+                                }
+                            }
+                        });
+                    });
                 }
             });
 

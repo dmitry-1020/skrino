@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 pub static INTER_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.otf");
 static INTER_MEDIUM_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Medium.otf");
 static INTER_SEMIBOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.otf");
+/// Phosphor icon font subsetted to the Private Use Area only (U+E000–U+F8FF).
+/// The stock `egui_phosphor` TTF also maps blank, zero-width glyphs at a–z
+/// (ligature triggers), which would swallow lowercase Latin text when the icon
+/// font sits in front of Inter; the subset carries icons and nothing else.
+static PHOSPHOR_PUA_BYTES: &[u8] = include_bytes!("../assets/fonts/Phosphor-PUA.ttf");
 
 /// Named font family for headings / emphasised labels (Inter SemiBold).
 pub const HEADING_FAMILY: &str = "inter-semibold";
@@ -124,18 +129,16 @@ pub fn build_fonts() -> FontDefinitions {
         .families
         .insert(FontFamily::Name(MEDIUM_FAMILY.into()), vec![MEDIUM_FAMILY.into(), "inter".into()]);
 
-    // Phosphor icon glyphs. Inter maps a few Private Use Area codepoints
-    // itself and would shadow those icons (e.g. FOLDER_OPEN, GEAR_SIX), so
-    // the icon font goes FIRST in the proportional family: it contains no
-    // text glyphs, so regular text still falls through to Inter.
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional)
-        && let Some(pos) = prop
-            .iter()
-            .position(|n| n.to_lowercase().contains("phosphor"))
-    {
-        let name = prop.remove(pos);
-        prop.insert(0, name);
+    // Phosphor icon glyphs. Inter maps hundreds of Private Use Area codepoints
+    // itself and would shadow many icons (FOLDER_OPEN, GEAR_SIX, CROP, …), so
+    // the icon font goes FIRST in the proportional family. That is safe only
+    // because we ship a PUA-only subset: the stock Phosphor TTF also has blank
+    // a–z glyphs that would erase lowercase Latin text (see PHOSPHOR_PUA_BYTES).
+    fonts
+        .font_data
+        .insert("phosphor".into(), FontData::from_static(PHOSPHOR_PUA_BYTES).into());
+    if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
+        prop.insert(0, "phosphor".into());
     }
 
     fonts

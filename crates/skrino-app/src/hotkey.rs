@@ -97,10 +97,12 @@ fn parse_code(lower: &str) -> Option<Code> {
     })
 }
 
-/// Registers the current hotkey and unregisters the previous one on change.
+/// Registers the two global hotkeys (region + full-screen capture) and
+/// re-registers them individually when a spec changes.
 pub struct HotkeyRegistration {
     manager: GlobalHotKeyManager,
-    current: Option<HotKey>,
+    region: Option<HotKey>,
+    full: Option<HotKey>,
 }
 
 impl HotkeyRegistration {
@@ -108,26 +110,45 @@ impl HotkeyRegistration {
         let manager = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
         Ok(Self {
             manager,
-            current: None,
+            region: None,
+            full: None,
         })
     }
 
-    /// The id of the currently registered hotkey (to match incoming events).
-    pub fn current_id(&self) -> Option<u32> {
-        self.current.map(|h| h.id())
+    /// The id of the currently registered region hotkey (to match incoming events).
+    pub fn region_id(&self) -> Option<u32> {
+        self.region.map(|h| h.id())
     }
 
-    /// Register `spec`, replacing any previously registered hotkey.
-    pub fn set(&mut self, spec: &str) -> Result<(), String> {
+    /// The id of the currently registered full-screen hotkey.
+    pub fn full_id(&self) -> Option<u32> {
+        self.full.map(|h| h.id())
+    }
+
+    /// Register the region hotkey `spec`, replacing any previous region hotkey.
+    pub fn set_region(&mut self, spec: &str) -> Result<(), String> {
+        Self::set_slot(&self.manager, &mut self.region, spec)
+    }
+
+    /// Register the full-screen hotkey `spec`, replacing any previous one.
+    pub fn set_full(&mut self, spec: &str) -> Result<(), String> {
+        Self::set_slot(&self.manager, &mut self.full, spec)
+    }
+
+    fn set_slot(
+        manager: &GlobalHotKeyManager,
+        slot: &mut Option<HotKey>,
+        spec: &str,
+    ) -> Result<(), String> {
         let hk = parse(spec)?;
-        if self.current == Some(hk) {
+        if *slot == Some(hk) {
             return Ok(());
         }
-        if let Some(old) = self.current.take() {
-            let _ = self.manager.unregister(old);
+        if let Some(old) = slot.take() {
+            let _ = manager.unregister(old);
         }
-        self.manager.register(hk).map_err(|e| e.to_string())?;
-        self.current = Some(hk);
+        manager.register(hk).map_err(|e| e.to_string())?;
+        *slot = Some(hk);
         Ok(())
     }
 }
@@ -154,6 +175,50 @@ mod tests {
     #[test]
     fn parses_function_key() {
         assert_eq!(parse("F12").unwrap(), HotKey::new(None, Code::F12));
+        assert_eq!(parse("f1").unwrap(), HotKey::new(None, Code::F1));
+    }
+
+    #[test]
+    fn parses_ctrl_shift_digit() {
+        // The new default hotkeys use digit keys.
+        let mods = Modifiers::CONTROL | Modifiers::SHIFT;
+        assert_eq!(
+            parse("Ctrl+Shift+3").unwrap(),
+            HotKey::new(Some(mods), Code::Digit3)
+        );
+        assert_eq!(
+            parse("ctrl+shift+4").unwrap(),
+            HotKey::new(Some(mods), Code::Digit4)
+        );
+    }
+
+    #[test]
+    fn parses_all_digits() {
+        let expected = [
+            ("0", Code::Digit0),
+            ("1", Code::Digit1),
+            ("2", Code::Digit2),
+            ("3", Code::Digit3),
+            ("4", Code::Digit4),
+            ("5", Code::Digit5),
+            ("6", Code::Digit6),
+            ("7", Code::Digit7),
+            ("8", Code::Digit8),
+            ("9", Code::Digit9),
+        ];
+        for (s, code) in expected {
+            assert_eq!(parse(s).unwrap(), HotKey::new(None, code), "digit {s}");
+        }
+    }
+
+    #[test]
+    fn parses_sample_letters() {
+        assert_eq!(parse("a").unwrap(), HotKey::new(None, Code::KeyA));
+        assert_eq!(parse("Z").unwrap(), HotKey::new(None, Code::KeyZ));
+        assert_eq!(
+            parse("Alt+q").unwrap(),
+            HotKey::new(Some(Modifiers::ALT), Code::KeyQ)
+        );
     }
 
     #[test]

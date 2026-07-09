@@ -13,6 +13,7 @@ pub enum TrayCommand {
     CaptureRegion,
     CaptureFull,
     OpenFile,
+    StartWindow,
     Settings,
     Quit,
 }
@@ -20,31 +21,31 @@ pub enum TrayCommand {
 pub struct Tray {
     _tray: TrayIcon,
     region: MenuItem,
+    full: MenuItem,
     id_region: MenuId,
     id_full: MenuId,
     id_open: MenuId,
+    id_start: MenuId,
     id_settings: MenuId,
     id_quit: MenuId,
 }
 
 impl Tray {
-    pub fn new(hotkey: &str) -> Result<Self, String> {
-        let region_label = if hotkey.trim().is_empty() {
-            "Скриншот области".to_string()
-        } else {
-            format!("Скриншот области  ({hotkey})")
-        };
-        let region = MenuItem::new(region_label, true, None);
-        let full = MenuItem::new("Скриншот всего экрана", true, None);
+    pub fn new(hotkey: &str, hotkey_full: &str) -> Result<Self, String> {
+        let region = MenuItem::new(region_label(hotkey), true, None);
+        let full = MenuItem::new(full_label(hotkey_full), true, None);
         let open = MenuItem::new("Открыть файл…", true, None);
+        let start = MenuItem::new("Открыть окно запуска", true, None);
         let settings = MenuItem::new("Настройки", true, None);
         let quit = MenuItem::new("Выход", true, None);
 
         let menu = Menu::new();
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
-        menu.append_items(&[&region, &full, &open, &sep1, &settings, &sep2, &quit])
-            .map_err(|e| e.to_string())?;
+        menu.append_items(&[
+            &region, &full, &open, &sep1, &start, &settings, &sep2, &quit,
+        ])
+        .map_err(|e| e.to_string())?;
 
         let (rgba, w, h) = make_icon_rgba();
         let icon = Icon::from_rgba(rgba, w, h).map_err(|e| e.to_string())?;
@@ -60,21 +61,19 @@ impl Tray {
             id_region: region.id().clone(),
             id_full: full.id().clone(),
             id_open: open.id().clone(),
+            id_start: start.id().clone(),
             id_settings: settings.id().clone(),
             id_quit: quit.id().clone(),
             region,
+            full,
             _tray: tray,
         })
     }
 
-    /// Update the region menu item to show the current hotkey.
-    pub fn set_region_hotkey(&self, hotkey: &str) {
-        let label = if hotkey.trim().is_empty() {
-            "Скриншот области".to_string()
-        } else {
-            format!("Скриншот области  ({hotkey})")
-        };
-        self.region.set_text(label);
+    /// Update the capture menu items to show the current hotkeys.
+    pub fn set_hotkeys(&self, hotkey: &str, hotkey_full: &str) {
+        self.region.set_text(region_label(hotkey));
+        self.full.set_text(full_label(hotkey_full));
     }
 
     /// Map an incoming menu-event id to a command.
@@ -85,6 +84,8 @@ impl Tray {
             Some(TrayCommand::CaptureFull)
         } else if id == &self.id_open {
             Some(TrayCommand::OpenFile)
+        } else if id == &self.id_start {
+            Some(TrayCommand::StartWindow)
         } else if id == &self.id_settings {
             Some(TrayCommand::Settings)
         } else if id == &self.id_quit {
@@ -92,6 +93,22 @@ impl Tray {
         } else {
             None
         }
+    }
+}
+
+fn region_label(hotkey: &str) -> String {
+    if hotkey.trim().is_empty() {
+        "Скриншот области".to_string()
+    } else {
+        format!("Скриншот области   {hotkey}")
+    }
+}
+
+fn full_label(hotkey: &str) -> String {
+    if hotkey.trim().is_empty() {
+        "Скриншот всего экрана".to_string()
+    } else {
+        format!("Скриншот всего экрана   {hotkey}")
     }
 }
 

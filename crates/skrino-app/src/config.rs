@@ -94,20 +94,49 @@ impl UploadSettings {
     /// Build a `skrino_upload::UploadConfig`, pulling secrets from the keychain.
     /// Returns `None` if a required secret is missing.
     pub fn to_upload_config(&self) -> Option<skrino_upload::UploadConfig> {
+        self.build_upload_config(None, None)
+    }
+
+    /// Build a `skrino_upload::UploadConfig` for a "test connection" against the
+    /// *unsaved* settings form. A freshly-typed password/passphrase is passed in
+    /// via `typed_*` and used directly (never round-tripped through the keychain);
+    /// when the field was left blank we fall back to a previously-saved secret.
+    /// Returns `None` if no usable secret is available.
+    pub fn to_upload_config_staged(
+        &self,
+        typed_password: &str,
+        typed_passphrase: &str,
+    ) -> Option<skrino_upload::UploadConfig> {
+        let pw = (!typed_password.is_empty()).then(|| typed_password.to_string());
+        let pp = (!typed_passphrase.is_empty()).then(|| typed_passphrase.to_string());
+        self.build_upload_config(pw, pp)
+    }
+
+    /// Shared builder: `override_*` secrets win over the keychain when present.
+    fn build_upload_config(
+        &self,
+        override_password: Option<String>,
+        override_passphrase: Option<String>,
+    ) -> Option<skrino_upload::UploadConfig> {
         use skrino_upload::{Auth, UploadConfig};
 
         let auth = if self.use_key_file {
-            let passphrase = if self.has_passphrase {
-                secret_get(KEY_PASSPHRASE).ok().flatten()
-            } else {
-                None
-            };
+            let passphrase = override_passphrase.or_else(|| {
+                if self.has_passphrase {
+                    secret_get(KEY_PASSPHRASE).ok().flatten()
+                } else {
+                    None
+                }
+            });
             Auth::KeyFile {
                 path: self.key_file.clone(),
                 passphrase,
             }
         } else {
-            let password = secret_get(KEY_PASSWORD).ok().flatten()?;
+            let password = match override_password {
+                Some(p) => p,
+                None => secret_get(KEY_PASSWORD).ok().flatten()?,
+            };
             Auth::Password(password)
         };
 
@@ -127,8 +156,12 @@ impl UploadSettings {
 #[serde(default)]
 pub struct AppConfig {
     pub theme: Theme,
-    /// Global hotkey for region capture, e.g. "PrintScreen" or "Ctrl+Shift+S".
+    /// Global hotkey for region capture, e.g. "Ctrl+Shift+3".
     pub hotkey: String,
+    /// Global hotkey for full-screen capture, e.g. "Ctrl+Shift+4". Added later,
+    /// so old configs (which lack the key) fall back via `default_hotkey_full`.
+    #[serde(default = "default_hotkey_full")]
+    pub hotkey_full: String,
     pub format: ImageFormat,
     /// JPEG quality 1..=100 (ignored for PNG).
     pub jpeg_quality: u8,
@@ -144,11 +177,17 @@ pub struct AppConfig {
     pub configured: bool,
 }
 
+/// Default full-screen hotkey (also used by `#[serde(default)]` for old configs).
+fn default_hotkey_full() -> String {
+    "Ctrl+Shift+4".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: Theme::Light,
-            hotkey: "PrintScreen".to_string(),
+            hotkey: "Ctrl+Shift+3".to_string(),
+            hotkey_full: default_hotkey_full(),
             format: ImageFormat::Png,
             jpeg_quality: 90,
             autostart: false,
@@ -333,6 +372,35 @@ mod tests {
         let back: AppConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(back.share_dest, ShareDestination::LocalDir { .. }));
         assert!(back.configured);
+    }
+
+    #[test]
+    fn old_config_without_hotkey_full_gets_default() {
+        // Earlier configs have no `hotkey_full`; it must fall back to the default
+        // while the user's saved region `hotkey` (e.g. old "PrintScreen") wins.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "last_save_dir": null,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(back.hotkey, "PrintScreen");
+        assert_eq!(back.hotkey_full, "Ctrl+Shift+4");
+    }
+
+    #[test]
+    fn default_hotkeys_are_ctrl_shift_digits() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.hotkey, "Ctrl+Shift+3");
+        assert_eq!(cfg.hotkey_full, "Ctrl+Shift+4");
+        // Both defaults must parse and be distinct.
+        assert!(crate::hotkey::parse(&cfg.hotkey).is_ok());
+        assert!(crate::hotkey::parse(&cfg.hotkey_full).is_ok());
+        assert_ne!(cfg.hotkey, cfg.hotkey_full);
     }
 
     #[test]

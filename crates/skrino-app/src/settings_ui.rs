@@ -1,9 +1,15 @@
 //! Settings window: upload (FTP/FTPS/SFTP) credentials and general options.
-//! Edits the live `AppConfig`; secrets go to the OS keychain, never the JSON.
+//!
+//! Editing is **staged**: the window mutates a private *working copy* of
+//! [`AppConfig`] plus staged secret strings. Nothing touches disk or the OS
+//! keychain until the user presses «Сохранить»; «Отмена» (and the titlebar
+//! close) discards the working copy wholesale. This keeps secrets out of the
+//! keychain until an explicit save, and makes the daemon reload fire exactly
+//! once per save instead of per keystroke.
 
 use std::sync::mpsc::Receiver;
 
-use egui::{ComboBox, RichText};
+use egui::{Align, ComboBox, Layout, RichText};
 use skrino_upload::{Protocol, UploadConfig};
 
 use crate::config::{AppConfig, ImageFormat, ShareDestination};
@@ -12,23 +18,38 @@ use crate::theme::{Palette, Theme};
 /// What the app should act on after the settings window ran this frame.
 #[derive(Default)]
 pub struct SettingsResult {
+    /// The window closed this frame (saved or cancelled).
     pub close: bool,
+    /// A hotkey (region or full) was changed and persisted — reload the daemon.
     pub hotkey_changed: bool,
-    pub theme_changed: bool,
+    /// The autostart flag was changed and persisted.
     pub autostart_changed: bool,
-    pub dirty: bool,
 }
 
 #[derive(Default)]
 pub struct SettingsWindow {
     pub open: bool,
+    /// Staged edits; `Some` while the window is open. Cloned from the live
+    /// config on open, written back only on save.
+    working: Option<AppConfig>,
     password_input: String,
     passphrase_input: String,
+    /// The user edited the password/passphrase field this session (so it should
+    /// be pushed to the keychain on save — clearing it deletes the secret).
+    password_touched: bool,
+    passphrase_touched: bool,
+    /// Validation message shown above the buttons when a save is refused.
+    save_error: Option<String>,
     test_rx: Option<Receiver<Result<String, String>>>,
     test_result: Option<Result<String, String>>,
     testing: bool,
 }
 
+/// Fields that may need a side-effect after a successful save.
+struct CommitChanged {
+    hotkey: bool,
+    autostart: bool,
+}
 
 impl SettingsWindow {
     pub fn show(
@@ -41,39 +62,125 @@ impl SettingsWindow {
         if !self.open {
             return result;
         }
-
-        // Snapshot fields that need a side-effect when changed.
-        let old_hotkey = cfg.hotkey.clone();
-        let old_theme = cfg.theme;
-        let old_autostart = cfg.autostart;
-        let before = cfg.clone();
-
+        // Snapshot the live config into a working copy the first frame we're open.
+        if self.working.is_none() {
+            self.reset_working(cfg);
+        }
         self.poll_test();
 
-        let mut open = self.open;
+        // Take the working copy out so section methods can borrow `self` freely.
+        let mut work = self.working.take().expect("working copy present while open");
+
+        let mut keep_open = true; // titlebar X clears this → cancel
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+
         egui::Window::new(RichText::new("Настройки").size(18.0))
-            .open(&mut open)
+            .open(&mut keep_open)
             .resizable(false)
             .collapsible(false)
             .default_width(460.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
-                    self.share_section(ui, cfg, palette);
+                egui::ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
+                    self.share_section(ui, &mut work, palette);
                     ui.add_space(10.0);
-                    self.general_section(ui, cfg, palette);
+                    self.general_section(ui, &mut work, palette);
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                if let Some(err) = &self.save_error {
+                    ui.label(RichText::new(err).size(12.0).color(palette.danger));
+                    ui.add_space(4.0);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Отмена").clicked() {
+                        cancel_clicked = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let save = egui::Button::new(
+                            RichText::new("Сохранить").color(egui::Color32::WHITE),
+                        )
+                        .fill(palette.accent);
+                        if ui.add(save).clicked() {
+                            save_clicked = true;
+                        }
+                    });
                 });
             });
-        self.open = open;
 
-        if !self.open {
+        if save_clicked {
+            match validate(&work) {
+                Ok(()) => {
+                    let changed = self.commit(cfg, work);
+                    result.close = true;
+                    result.hotkey_changed = changed.hotkey;
+                    result.autostart_changed = changed.autostart;
+                    self.finish_close();
+                }
+                Err(msg) => {
+                    // Keep the window open with the offending values for a fix.
+                    self.save_error = Some(msg);
+                    self.working = Some(work);
+                }
+            }
+        } else if cancel_clicked || !keep_open {
+            // Discard the working copy; nothing written to disk or keychain.
             result.close = true;
+            self.finish_close();
+        } else {
+            self.working = Some(work);
         }
-        result.hotkey_changed = cfg.hotkey != old_hotkey;
-        result.theme_changed = cfg.theme != old_theme;
-        result.autostart_changed = cfg.autostart != old_autostart;
-        result.dirty = *cfg != before || result.close;
         result
+    }
+
+    /// Clone the live config into the working copy and reset staged inputs.
+    fn reset_working(&mut self, cfg: &AppConfig) {
+        self.working = Some(cfg.clone());
+        self.password_input.clear();
+        self.passphrase_input.clear();
+        self.password_touched = false;
+        self.passphrase_touched = false;
+        self.save_error = None;
+        self.test_result = None;
+        self.test_rx = None;
+        self.testing = false;
+    }
+
+    /// Close the window and drop all staged state.
+    fn finish_close(&mut self) {
+        self.open = false;
+        self.working = None;
+        self.password_input.clear();
+        self.passphrase_input.clear();
+        self.password_touched = false;
+        self.passphrase_touched = false;
+        self.save_error = None;
+        self.test_result = None;
+        self.test_rx = None;
+        self.testing = false;
+    }
+
+    /// Write the working copy back to the live config, push staged secrets to the
+    /// keychain, and persist. Returns which side-effect-worthy fields changed.
+    fn commit(&mut self, cfg: &mut AppConfig, work: AppConfig) -> CommitChanged {
+        let changed = CommitChanged {
+            hotkey: cfg.hotkey != work.hotkey || cfg.hotkey_full != work.hotkey_full,
+            autostart: cfg.autostart != work.autostart,
+        };
+        *cfg = work;
+        // Secrets reach the keychain ONLY here, on save.
+        if cfg.upload.use_key_file {
+            if self.passphrase_touched {
+                cfg.set_passphrase(&self.passphrase_input);
+            }
+        } else if self.password_touched {
+            cfg.set_password(&self.password_input);
+        }
+        cfg.save();
+        changed
     }
 
     /// «Поделиться»: choose a local folder or the FTP/SFTP server. When the
@@ -168,9 +275,9 @@ impl SettingsWindow {
                     && let Some(path) = rfd::FileDialog::new()
                         .set_title("Выберите файл приватного ключа")
                         .pick_file()
-                    {
-                        cfg.upload.key_file = path.display().to_string();
-                    }
+                {
+                    cfg.upload.key_file = path.display().to_string();
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Пароль ключа");
@@ -180,8 +287,8 @@ impl SettingsWindow {
                         .password(true)
                         .hint_text(if has { "•••• сохранён" } else { "" }),
                 );
-                if resp.lost_focus() && !self.passphrase_input.is_empty() {
-                    cfg.set_passphrase(&self.passphrase_input);
+                if resp.changed() {
+                    self.passphrase_touched = true;
                 }
             });
         } else {
@@ -193,8 +300,8 @@ impl SettingsWindow {
                         .password(true)
                         .hint_text(if has { "•••• сохранён" } else { "" }),
                 );
-                if resp.lost_focus() && !self.password_input.is_empty() {
-                    cfg.set_password(&self.password_input);
+                if resp.changed() {
+                    self.password_touched = true;
                 }
             });
         }
@@ -251,23 +358,12 @@ impl SettingsWindow {
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Горячая клавиша");
-                ui.vertical(|ui| {
-                    ui.text_edit_singleline(&mut cfg.hotkey);
-                    if crate::hotkey::parse(&cfg.hotkey).is_err() {
-                        ui.label(
-                            RichText::new("Неверная комбинация")
-                                .size(11.0)
-                                .color(palette.danger),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new("Например: PrintScreen или Ctrl+Shift+S")
-                                .size(11.0)
-                                .color(palette.text_secondary),
-                        );
-                    }
-                });
+                ui.label("Область");
+                hotkey_field(ui, palette, &mut cfg.hotkey, "Ctrl+Shift+3");
+                ui.end_row();
+
+                ui.label("Весь экран");
+                hotkey_field(ui, palette, &mut cfg.hotkey_full, "Ctrl+Shift+4");
                 ui.end_row();
 
                 ui.label("Формат");
@@ -291,21 +387,16 @@ impl SettingsWindow {
                 ui.end_row();
             });
 
-        ui.checkbox(
-            &mut cfg.autostart,
-            "Запускать в фоне при старте системы",
-        );
+        ui.checkbox(&mut cfg.autostart, "Запускать в фоне при старте системы");
     }
 
-    fn start_test(&mut self, cfg: &mut AppConfig) {
-        // Persist any freshly-typed secret so the worker can read it back.
-        if !self.password_input.is_empty() {
-            cfg.set_password(&self.password_input);
-        }
-        if !self.passphrase_input.is_empty() {
-            cfg.set_passphrase(&self.passphrase_input);
-        }
-        let Some(config) = cfg.upload.to_upload_config() else {
+    /// Kick off a background connection test against the *unsaved* form values,
+    /// including a freshly-typed password (never round-tripped via the keychain).
+    fn start_test(&mut self, cfg: &AppConfig) {
+        let Some(config) = cfg
+            .upload
+            .to_upload_config_staged(&self.password_input, &self.passphrase_input)
+        else {
             self.test_result = Some(Err("не задан пароль/ключ".into()));
             return;
         };
@@ -339,6 +430,41 @@ impl SettingsWindow {
             }
         }
     }
+}
+
+/// Validate the staged config before a save is allowed.
+fn validate(work: &AppConfig) -> Result<(), String> {
+    let region = crate::hotkey::parse(&work.hotkey)
+        .map_err(|_| "Горячая клавиша «Область» указана неверно".to_string())?;
+    let full = crate::hotkey::parse(&work.hotkey_full)
+        .map_err(|_| "Горячая клавиша «Весь экран» указана неверно".to_string())?;
+    if region == full {
+        return Err("Горячие клавиши «Область» и «Весь экран» должны различаться".into());
+    }
+    if work.upload.port == 0 {
+        return Err("Порт должен быть больше нуля".into());
+    }
+    Ok(())
+}
+
+/// A hotkey text field with a live red error when the current text won't parse.
+fn hotkey_field(ui: &mut egui::Ui, palette: &Palette, value: &mut String, example: &str) {
+    ui.vertical(|ui| {
+        ui.text_edit_singleline(value);
+        if crate::hotkey::parse(value).is_err() {
+            ui.label(
+                RichText::new("Неверная комбинация")
+                    .size(11.0)
+                    .color(palette.danger),
+            );
+        } else {
+            ui.label(
+                RichText::new(format!("Например: {example}"))
+                    .size(11.0)
+                    .color(palette.text_secondary),
+            );
+        }
+    });
 }
 
 fn section_header(ui: &mut egui::Ui, palette: &Palette, text: &str) {

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use skrino_upload::UploadConfig;
+use skrino_upload::{UploadConfig, UploadError};
 
 pub enum ShareResult {
     /// Uploaded; here is the public URL.
@@ -14,6 +14,9 @@ pub enum ShareResult {
     /// Upload failed. `saved_to` is the local fallback path if the save worked.
     Failure {
         error: String,
+        /// The failure was an authentication error (bad password/key) — the UI
+        /// offers an «Открыть настройки» rescue on top of «Повторить».
+        auth: bool,
         saved_to: Option<PathBuf>,
     },
 }
@@ -38,9 +41,11 @@ impl ShareHandle {
                 let result = match skrino_upload::upload(&config, &filename, &png_bytes) {
                     Ok(url) => ShareResult::Success(url),
                     Err(e) => {
+                        let auth = matches!(e, UploadError::Auth(_));
                         let saved_to = save_fallback(&fallback_dir, &filename, &png_bytes);
                         ShareResult::Failure {
                             error: e.to_string(),
+                            auth,
                             saved_to,
                         }
                     }
@@ -73,6 +78,7 @@ impl ShareHandle {
                 self.done = true;
                 Some(ShareResult::Failure {
                     error: "рабочий поток завершился без ответа".into(),
+                    auth: false,
                     saved_to: None,
                 })
             }

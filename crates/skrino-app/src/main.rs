@@ -39,13 +39,25 @@ fn main() {
     let mode = parse_mode();
     let config = AppConfig::load();
 
+    // No-arg launch is context-sensitive:
+    //   * first run (configured == false) → show the Start window (below);
+    //   * after setup (configured == true) → this is just a "make sure it's
+    //     running" double-click: spawn the tray daemon (the single-instance
+    //     mutex dedupes) and exit without any window.
+    // `--start` is the escape hatch that always forces the Start window.
+    let forced_start = std::env::args().any(|a| a == "--start");
+    if matches!(mode, LaunchMode::Start) && config.configured && !forced_start {
+        spawn_tray();
+        return;
+    }
+
     // Start-window is shown immediately; one-shot modes stay hidden until the app
     // reshapes the root window on its first frame (capture happens first).
     let start_visible = matches!(mode, LaunchMode::Start);
     let initial_size: Vec2 = match mode {
-        LaunchMode::Start => Vec2::new(420.0, 356.0),
+        LaunchMode::Start => Vec2::new(420.0, 392.0),
         LaunchMode::Settings => Vec2::new(540.0, 620.0),
-        _ => Vec2::new(420.0, 356.0),
+        _ => Vec2::new(420.0, 392.0),
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -72,6 +84,14 @@ fn main() {
     }
 }
 
+/// Spawn the background tray daemon and detach. The daemon's single-instance
+/// mutex makes a redundant spawn silent and harmless.
+fn spawn_tray() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).arg("--tray").spawn();
+    }
+}
+
 /// Map CLI flags to a UI launch mode (first recognised flag wins).
 fn parse_mode() -> LaunchMode {
     for arg in std::env::args().skip(1) {
@@ -81,6 +101,7 @@ fn parse_mode() -> LaunchMode {
             "--open-file" => return LaunchMode::OpenFile,
             "--settings" => return LaunchMode::Settings,
             "--overlay-smoke" => return LaunchMode::OverlaySmoke,
+            "--start" => return LaunchMode::Start,
             _ => {}
         }
     }
@@ -100,6 +121,7 @@ mod arg_tests {
                 "--open-file" => return LaunchMode::OpenFile,
                 "--settings" => return LaunchMode::Settings,
                 "--overlay-smoke" => return LaunchMode::OverlaySmoke,
+                "--start" => return LaunchMode::Start,
                 _ => {}
             }
         }
@@ -119,6 +141,13 @@ mod arg_tests {
         assert_eq!(mode_from(["--open-file"]), LaunchMode::OpenFile);
         assert_eq!(mode_from(["--settings"]), LaunchMode::Settings);
         assert_eq!(mode_from(["--overlay-smoke"]), LaunchMode::OverlaySmoke);
+        assert_eq!(mode_from(["--start"]), LaunchMode::Start);
+    }
+
+    #[test]
+    fn start_flag_wins_over_later_flags() {
+        // `--start` is an explicit escape hatch: first recognised flag wins.
+        assert_eq!(mode_from(["--start", "--settings"]), LaunchMode::Start);
     }
 
     #[test]

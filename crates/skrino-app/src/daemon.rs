@@ -37,7 +37,8 @@ enum UserEvent {
 struct Daemon {
     tray: Option<Tray>,
     hotkeys: Option<HotkeyRegistration>,
-    hotkey_id: Option<u32>,
+    region_id: Option<u32>,
+    full_id: Option<u32>,
     initialized: bool,
 }
 
@@ -53,7 +54,7 @@ impl Daemon {
 
     fn init(&mut self) {
         let config = AppConfig::load();
-        match Tray::new(&config.hotkey) {
+        match Tray::new(&config.hotkey, &config.hotkey_full) {
             Ok(t) => self.tray = Some(t),
             Err(e) => log::error!("tray init failed: {e}"),
         }
@@ -64,28 +65,40 @@ impl Daemon {
                 None
             }
         };
-        if let Some(h) = &mut hk
-            && let Err(e) = h.set(&config.hotkey)
-        {
-            log::warn!("hotkey register failed: {e}");
+        if let Some(h) = &mut hk {
+            if let Err(e) = h.set_region(&config.hotkey) {
+                log::warn!("region hotkey register failed: {e}");
+            }
+            if let Err(e) = h.set_full(&config.hotkey_full) {
+                log::warn!("full hotkey register failed: {e}");
+            }
         }
-        self.hotkey_id = hk.as_ref().and_then(|h| h.current_id());
+        self.region_id = hk.as_ref().and_then(|h| h.region_id());
+        self.full_id = hk.as_ref().and_then(|h| h.full_id());
         self.hotkeys = hk;
     }
 
-    /// Re-read the config and re-register the hotkey (after a settings change).
+    /// Re-read the config and re-register both hotkeys (after a settings change).
     fn reload(&mut self) {
         let config = AppConfig::load();
         if let Some(h) = &mut self.hotkeys {
-            match h.set(&config.hotkey) {
-                Ok(()) => self.hotkey_id = h.current_id(),
-                Err(e) => log::warn!("hotkey re-register failed: {e}"),
+            match h.set_region(&config.hotkey) {
+                Ok(()) => self.region_id = h.region_id(),
+                Err(e) => log::warn!("region hotkey re-register failed: {e}"),
+            }
+            match h.set_full(&config.hotkey_full) {
+                Ok(()) => self.full_id = h.full_id(),
+                Err(e) => log::warn!("full hotkey re-register failed: {e}"),
             }
         }
         if let Some(t) = &self.tray {
-            t.set_region_hotkey(&config.hotkey);
+            t.set_hotkeys(&config.hotkey, &config.hotkey_full);
         }
-        log::info!("daemon reloaded config (hotkey: {})", config.hotkey);
+        log::info!(
+            "daemon reloaded config (region: {}, full: {})",
+            config.hotkey,
+            config.hotkey_full
+        );
     }
 }
 
@@ -110,6 +123,7 @@ impl ApplicationHandler<UserEvent> for Daemon {
                     Some(TrayCommand::CaptureRegion) => self.spawn_ui("--capture-region"),
                     Some(TrayCommand::CaptureFull) => self.spawn_ui("--capture-full"),
                     Some(TrayCommand::OpenFile) => self.spawn_ui("--open-file"),
+                    Some(TrayCommand::StartWindow) => self.spawn_ui("--start"),
                     Some(TrayCommand::Settings) => self.spawn_ui("--settings"),
                     Some(TrayCommand::Quit) => {
                         remove_pidfile();
@@ -119,8 +133,10 @@ impl ApplicationHandler<UserEvent> for Daemon {
                 }
             }
             UserEvent::Hotkey(id) => {
-                if Some(id) == self.hotkey_id {
+                if Some(id) == self.region_id {
                     self.spawn_ui("--capture-region");
+                } else if Some(id) == self.full_id {
+                    self.spawn_ui("--capture-full");
                 }
             }
             UserEvent::ReloadConfig => self.reload(),
@@ -165,7 +181,8 @@ pub fn run() {
     let mut app = Daemon {
         tray: None,
         hotkeys: None,
-        hotkey_id: None,
+        region_id: None,
+        full_id: None,
         initialized: false,
     };
     if let Err(e) = event_loop.run_app(&mut app) {

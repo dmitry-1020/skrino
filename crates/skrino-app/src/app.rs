@@ -30,8 +30,8 @@ use crate::share::{ShareHandle, ShareResult};
 use crate::theme::{self, Palette, Theme};
 use crate::toast::{ToastAction, Toasts};
 
-/// Start-window size.
-pub const START_SIZE: Vec2 = Vec2::new(420.0, 356.0);
+/// Start-window size (tall enough for the first-run hint line).
+pub const START_SIZE: Vec2 = Vec2::new(420.0, 392.0);
 /// Editor window default size.
 const EDITOR_SIZE: Vec2 = Vec2::new(1120.0, 780.0);
 /// Settings-window host size (fits the settings dialog).
@@ -199,12 +199,22 @@ impl SkrinoApp {
         }
     }
 
-    /// Spawn a background tray daemon (`--tray`) and exit this UI process.
-    fn go_background(&self) -> ! {
+    /// Mark first-run complete and make sure the tray daemon is running. Called
+    /// on every exit path of an interactive Start-window process, so that after
+    /// the first session Skrino lives in the tray. The daemon's single-instance
+    /// mutex makes a redundant spawn silent.
+    fn settle_into_background(&mut self) {
+        self.config.configured = true;
+        self.config.save();
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::process::Command::new(exe).arg("--tray").spawn();
         }
-        self.quit();
+    }
+
+    /// «Работать в фоне»: settle into the tray and exit this UI process.
+    fn go_background(&mut self) -> ! {
+        self.settle_into_background();
+        std::process::exit(0);
     }
 
     // --- editor actions ---
@@ -365,12 +375,17 @@ impl SkrinoApp {
                         Err(_) => self.toasts.link(format!("Готово: {url}"), url),
                     }
                 }
-                ShareResult::Failure { error, saved_to } => {
+                ShareResult::Failure { error, auth, saved_to } => {
                     let extra = saved_to
                         .map(|p| format!(" • сохранено локально: {}", p.display()))
                         .unwrap_or_default();
-                    self.toasts
-                        .error_retry(format!("Не удалось отправить: {error}{extra}"));
+                    let msg = format!("Не удалось отправить: {error}{extra}");
+                    if auth {
+                        // Bad credentials: offer a jump to settings alongside retry.
+                        self.toasts.error_retry_auth(msg);
+                    } else {
+                        self.toasts.error_retry(msg);
+                    }
                 }
             }
             self.share = None;
@@ -380,11 +395,9 @@ impl SkrinoApp {
     // --- settings side-effects ---
 
     fn handle_settings_result(&mut self, res: SettingsResult) {
-        if res.dirty {
-            self.config.configured = true;
-            self.config.save();
-        }
-        // The daemon owns the global hotkey; ask it to reload after we persisted.
+        // The settings window already persisted the config on «Сохранить»; here
+        // we only trigger the OS-level side-effects of a successful save.
+        // The daemon owns the global hotkeys; ask it to reload after we persisted.
         if res.hotkey_changed {
             crate::daemon::reload_if_running();
         }
@@ -448,7 +461,12 @@ impl SkrinoApp {
                     .frame(egui::Frame::new().fill(palette.window))
                     .show(ctx, |_ui| {});
             }
-            AppState::Start => match draw_start(ctx, palette) {
+            AppState::Start => match draw_start(
+                ctx,
+                palette,
+                !self.config.configured,
+                &self.config.hotkey,
+            ) {
                 StartSignal::Region => next = Some(self.begin_region_capture(false)),
                 StartSignal::Full => next = Some(self.begin_full_capture()),
                 StartSignal::Open => next = Some(self.begin_open_file()),
@@ -482,7 +500,12 @@ impl SkrinoApp {
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             // Closing the window ends the process (no tray in the UI process).
-            self.config.save();
+            if self.is_interactive() {
+                // First-run / Start window: settle into the tray on the way out.
+                self.settle_into_background();
+            } else {
+                self.config.save();
+            }
         }
     }
 }
@@ -529,6 +552,12 @@ impl eframe::App for SkrinoApp {
             }
             ToastAction::RevealFile(path) => reveal_in_explorer(&path),
             ToastAction::Retry => self.retry_share(),
+            ToastAction::OpenSettings => {
+                // Spawn a detached settings process (the tray daemon owns config).
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                }
+            }
             ToastAction::None => {}
         }
 
@@ -656,7 +685,12 @@ enum StartSignal {
     Background,
 }
 
-fn draw_start(ctx: &egui::Context, palette: &Palette) -> StartSignal {
+fn draw_start(
+    ctx: &egui::Context,
+    palette: &Palette,
+    first_run: bool,
+    hotkey: &str,
+) -> StartSignal {
     let mut sig = StartSignal::None;
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(palette.window).inner_margin(egui::Margin::same(20)))
@@ -728,6 +762,26 @@ fn draw_start(ctx: &egui::Context, palette: &Palette) -> StartSignal {
                         sig = StartSignal::Background;
                     }
                 });
+
+                // First-run hint: explain that Skrino keeps living in the tray.
+                if first_run {
+                    ui.add_space(10.0);
+                    let hk = if hotkey.trim().is_empty() {
+                        "горячей клавише".to_string()
+                    } else {
+                        hotkey.to_string()
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "Skrino будет работать в фоне — иконка в трее, скриншот по {hk}"
+                            ))
+                            .size(12.0)
+                            .color(palette.text_secondary),
+                        )
+                        .wrap(),
+                    );
+                }
             });
         });
     sig
