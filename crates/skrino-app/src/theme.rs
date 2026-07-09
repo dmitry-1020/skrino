@@ -48,6 +48,10 @@ pub struct Palette {
     pub text_secondary: Color32,
     pub accent: Color32,
     pub accent_hover: Color32,
+    /// Foreground (text/icon) colour to use on top of an accent-filled
+    /// surface. The accent is a light golden yellow, so this is near-black in
+    /// both themes — never `Color32::WHITE`.
+    pub accent_fg: Color32,
     /// Neutral canvas backdrop behind the screenshot.
     pub canvas_bg: Color32,
     pub danger: Color32,
@@ -64,8 +68,9 @@ impl Palette {
                 border: Color32::from_rgb(0x35, 0x36, 0x3E),
                 text: Color32::from_rgb(0xE8, 0xE9, 0xED),
                 text_secondary: Color32::from_rgb(0x9A, 0x9C, 0xA6),
-                accent: Color32::from_rgb(0x35, 0x74, 0xF0),
-                accent_hover: Color32::from_rgb(0x4A, 0x86, 0xF5),
+                accent: Color32::from_rgb(0xF8, 0xBB, 0x10),
+                accent_hover: Color32::from_rgb(0xFF, 0xC9, 0x3A),
+                accent_fg: Color32::from_rgb(0x1A, 0x1A, 0x1A),
                 canvas_bg: Color32::from_rgb(0x17, 0x18, 0x1C),
                 danger: Color32::from_rgb(0xE8, 0x48, 0x4D),
                 success: Color32::from_rgb(0x2E, 0xAE, 0x5E),
@@ -77,8 +82,9 @@ impl Palette {
                 border: Color32::from_rgb(0xE2, 0xE3, 0xE8),
                 text: Color32::from_rgb(0x1A, 0x1B, 0x1F),
                 text_secondary: Color32::from_rgb(0x6A, 0x6C, 0x74),
-                accent: Color32::from_rgb(0x35, 0x74, 0xF0),
-                accent_hover: Color32::from_rgb(0x2A, 0x63, 0xD8),
+                accent: Color32::from_rgb(0xF8, 0xBB, 0x10),
+                accent_hover: Color32::from_rgb(0xDF, 0xA6, 0x0D),
+                accent_fg: Color32::from_rgb(0x1A, 0x1A, 0x1A),
                 canvas_bg: Color32::from_rgb(0xDD, 0xDF, 0xE4),
                 danger: Color32::from_rgb(0xE8, 0x48, 0x4D),
                 success: Color32::from_rgb(0x1F, 0x9B, 0x50),
@@ -150,7 +156,29 @@ pub fn heading_font(size: f32) -> FontId {
 }
 
 /// Apply the full custom style for `theme` to the context.
+///
+/// Root cause of a previous "font sizes differ between light and dark" bug:
+/// egui keeps *two* independent `Style`s (one per [`egui::Theme`]) and picks
+/// between them via `ctx.theme()`, which by default follows
+/// [`egui::ThemePreference::System`] (i.e. the OS's light/dark setting,
+/// falling back to `Theme::Dark` until the OS preference is even reported).
+/// Calling plain `ctx.set_style(..)` only ever writes into whichever slot
+/// happens to be *currently active* by that OS-driven rule — NOT the slot
+/// matching the `theme` argument. Whenever the app's own theme setting
+/// didn't match the OS theme (or on the first frame, before winit had
+/// reported the OS theme at all), the "other" slot was left holding egui's
+/// stock default `Style` — different heading/text sizes — and would surface
+/// the moment `ctx.theme()` flipped to it. The fix: pin the theme preference
+/// to our own setting (decoupling entirely from the OS) and write the style
+/// into that exact slot via `set_style_of`, so both slots always hold our
+/// identical `text_styles` regardless of OS state or call order.
 pub fn apply(ctx: &egui::Context, theme: Theme) {
+    let egui_theme = match theme {
+        Theme::Dark => egui::Theme::Dark,
+        Theme::Light => egui::Theme::Light,
+    };
+    ctx.set_theme(egui::ThemePreference::from(egui_theme));
+
     let p = Palette::for_theme(theme);
     let mut style = Style::default();
 
@@ -205,7 +233,7 @@ pub fn apply(ctx: &egui::Context, theme: Theme) {
     v.widgets.active.bg_fill = p.accent;
     v.widgets.active.weak_bg_fill = p.accent;
     v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-    v.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    v.widgets.active.fg_stroke = Stroke::new(1.5, p.accent_fg);
     v.widgets.active.corner_radius = radius;
     v.widgets.active.expansion = 0.0;
 
@@ -237,5 +265,5 @@ pub fn apply(ctx: &egui::Context, theme: Theme) {
     ]
     .into();
 
-    ctx.set_style(style);
+    ctx.set_style_of(egui_theme, style);
 }

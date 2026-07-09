@@ -63,6 +63,13 @@ pub struct EditorState {
     zoom: f32,
     offset: Vec2,
     fit_pending: bool,
+    /// Debounce for `fit_pending`: the OS window resize that should precede a
+    /// fit (opening the editor, or reshaping from the overlay) lands a frame
+    /// or more after we request it, so `ui.max_rect()` briefly still reports
+    /// the *old* window size. We only actually fit once the canvas rect has
+    /// read the same size on two consecutive frames — otherwise the fit would
+    /// lock in a tiny zoom computed against the stale size. See `canvas.rs`.
+    fit_stable_size: Option<Vec2>,
     /// Canvas rect from the last frame (for centred zoom from the slider).
     canvas_rect: egui::Rect,
 
@@ -102,6 +109,7 @@ impl EditorState {
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit_pending: true,
+            fit_stable_size: None,
             canvas_rect: egui::Rect::ZERO,
             drag: None,
             poly: Vec::new(),

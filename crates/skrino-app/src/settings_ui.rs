@@ -1,15 +1,23 @@
-//! Settings window: upload (FTP/FTPS/SFTP) credentials and general options.
+//! Settings screen: upload (FTP/FTPS/SFTP) credentials and general options.
 //!
-//! Editing is **staged**: the window mutates a private *working copy* of
-//! [`AppConfig`] plus staged secret strings. Nothing touches disk or the OS
-//! keychain until the user presses «Сохранить»; «Отмена» (and the titlebar
-//! close) discards the working copy wholesale. This keeps secrets out of the
-//! keychain until an explicit save, and makes the daemon reload fire exactly
-//! once per save instead of per keystroke.
+//! Rendered as the ROOT window's full content (a bottom action bar plus a
+//! scrollable central panel) — NOT a floating `egui::Window` nested inside
+//! another window. `app.rs` hosts this two ways: the standalone `--settings`
+//! process makes it the entire root window content, and the Start window
+//! swaps its own content for this one when the user clicks «Настройки»,
+//! resizing the root viewport either way (see `WindowMode::Settings` in
+//! `app.rs`) and swapping back on Отмена/Сохранить.
+//!
+//! Editing is **staged**: mutates a private *working copy* of [`AppConfig`]
+//! plus staged secret strings. Nothing touches disk or the OS keychain until
+//! the user presses «Сохранить»; «Отмена» discards the working copy
+//! wholesale. This keeps secrets out of the keychain until an explicit save,
+//! and makes the daemon reload fire exactly once per save instead of per
+//! keystroke.
 
 use std::sync::mpsc::Receiver;
 
-use egui::{Align, ComboBox, Layout, RichText};
+use egui::{Align, ComboBox, CornerRadius, Layout, RichText};
 use skrino_upload::{Protocol, UploadConfig};
 
 use crate::config::{AppConfig, ImageFormat, ShareDestination};
@@ -52,6 +60,10 @@ struct CommitChanged {
 }
 
 impl SettingsWindow {
+    /// Render the settings as the ROOT window's full content (no floating
+    /// inner `egui::Window` — see the module docs for why). The caller is
+    /// responsible for sizing/titling the actual OS window; this only draws
+    /// into whatever panels/central-panel space it's given this frame.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -71,31 +83,20 @@ impl SettingsWindow {
         // Take the working copy out so section methods can borrow `self` freely.
         let mut work = self.working.take().expect("working copy present while open");
 
-        let mut keep_open = true; // titlebar X clears this → cancel
         let mut save_clicked = false;
         let mut cancel_clicked = false;
 
-        egui::Window::new(RichText::new("Настройки").size(18.0))
-            .open(&mut keep_open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(460.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        // Сохранить/Отмена pinned at the bottom regardless of scroll position.
+        egui::TopBottomPanel::bottom("skrino_settings_actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.window)
+                    .inner_margin(egui::Margin::symmetric(20, 14)),
+            )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
-                    self.share_section(ui, &mut work, palette);
-                    ui.add_space(10.0);
-                    self.save_section(ui, &mut work, palette);
-                    ui.add_space(10.0);
-                    self.general_section(ui, &mut work, palette);
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
                 if let Some(err) = &self.save_error {
                     ui.label(RichText::new(err).size(12.0).color(palette.danger));
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Отмена").clicked() {
@@ -103,7 +104,7 @@ impl SettingsWindow {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let save = egui::Button::new(
-                            RichText::new("Сохранить").color(egui::Color32::WHITE),
+                            RichText::new("Сохранить").color(palette.accent_fg),
                         )
                         .fill(palette.accent);
                         if ui.add(save).clicked() {
@@ -111,6 +112,31 @@ impl SettingsWindow {
                         }
                     });
                 });
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.window)
+                    .inner_margin(egui::Margin::symmetric(20, 16)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Настройки")
+                        .font(crate::theme::heading_font(20.0))
+                        .color(palette.text),
+                );
+                ui.add_space(12.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        section_card(ui, palette, |ui| self.share_section(ui, &mut work, palette));
+                        ui.add_space(12.0);
+                        section_card(ui, palette, |ui| self.save_section(ui, &mut work, palette));
+                        ui.add_space(12.0);
+                        section_card(ui, palette, |ui| self.general_section(ui, &mut work, palette));
+                        ui.add_space(4.0);
+                    });
             });
 
         if save_clicked {
@@ -123,12 +149,12 @@ impl SettingsWindow {
                     self.finish_close();
                 }
                 Err(msg) => {
-                    // Keep the window open with the offending values for a fix.
+                    // Keep the settings view open with the offending values for a fix.
                     self.save_error = Some(msg);
                     self.working = Some(work);
                 }
             }
-        } else if cancel_clicked || !keep_open {
+        } else if cancel_clicked {
             // Discard the working copy; nothing written to disk or keychain.
             result.close = true;
             self.finish_close();
@@ -221,8 +247,8 @@ impl SettingsWindow {
         }
 
         if is_server {
-            ui.add_space(8.0);
-            self.upload_section(ui, cfg, palette);
+            ui.add_space(12.0);
+            section_card(ui, palette, |ui| self.upload_section(ui, cfg, palette));
         }
     }
 
@@ -495,6 +521,24 @@ fn hotkey_field(ui: &mut egui::Ui, palette: &Palette, value: &mut String, exampl
             );
         }
     });
+}
+
+/// Wrap one settings section in its own visually distinct card: a surface-tint
+/// background clearly separate from the window bg (in both themes), rounded
+/// corners, and comfortable inner padding. Keeps the sections from blending
+/// into one grey wall of controls.
+fn section_card(ui: &mut egui::Ui, palette: &Palette, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(palette.surface)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(15))
+        .show(ui, |ui| {
+            // Force full card width — otherwise the frame background would
+            // only hug the width of its widest row instead of reading as a
+            // distinct card block.
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
 }
 
 fn section_header(ui: &mut egui::Ui, palette: &Palette, text: &str) {

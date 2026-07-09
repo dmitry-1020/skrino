@@ -16,8 +16,21 @@ pub fn canvas_ui(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) 
     let canvas = ui.max_rect();
     state.canvas_rect = canvas;
     if state.fit_pending {
-        state.fit(canvas);
-        state.fit_pending = false;
+        // The OS window resize that should precede this fit (opening the
+        // editor, or reshaping in from the overlay) is asynchronous, so
+        // `canvas` may still be the *old* window's rect for a frame or two.
+        // Only fit once the size has read stable across two consecutive
+        // frames, to avoid locking in a zoom computed against a stale,
+        // too-small canvas (previously showed the image at ~15% instead of
+        // filling the window).
+        if state.fit_stable_size == Some(canvas.size()) {
+            state.fit(canvas);
+            state.fit_pending = false;
+            state.fit_stable_size = None;
+        } else {
+            state.fit_stable_size = Some(canvas.size());
+            ui.ctx().request_repaint();
+        }
     }
 
     let response = ui.interact(canvas, ui.id().with("canvas"), Sense::click_and_drag());
@@ -357,9 +370,11 @@ fn crop_overlay(
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     let apply = ui.add(
-                        egui::Button::new(egui::RichText::new("Применить").color(Color32::WHITE))
-                            .fill(palette.accent)
-                            .corner_radius(CornerRadius::same(8)),
+                        egui::Button::new(
+                            egui::RichText::new("Применить").color(palette.accent_fg),
+                        )
+                        .fill(palette.accent)
+                        .corner_radius(CornerRadius::same(8)),
                     );
                     let cancel = ui.add(
                         egui::Button::new("Отмена").corner_radius(CornerRadius::same(8)),
@@ -561,6 +576,7 @@ impl EditorState {
     /// Zoom to fit the current canvas (used by the "По размеру окна" button).
     pub fn request_fit(&mut self) {
         self.fit_pending = true;
+        self.fit_stable_size = None;
     }
 
     /// Read-only accessors used by the toolbar module.

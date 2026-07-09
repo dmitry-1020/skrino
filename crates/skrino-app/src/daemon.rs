@@ -14,23 +14,32 @@
 //! (`Global\skrino-tray-reload`); a blocked helper thread wakes and asks the
 //! loop to re-read the config — no process killing, no polling.
 
+use std::time::{Duration, Instant};
+
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+use tray_icon::TrayIconEvent;
 use tray_icon::menu::{MenuEvent, MenuId};
 
 use crate::config::AppConfig;
 use crate::hotkey::HotkeyRegistration;
 use crate::tray::{Tray, TrayCommand};
 
+/// Left tray-icon clicks within this window of the previous one are ignored
+/// (each spawns a one-shot process, so a double-fire would just open two
+/// Start windows — cheap but pointless).
+const TRAY_CLICK_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// Wake reasons delivered to the event loop.
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuId),
     Hotkey(u32),
+    Tray(TrayIconEvent),
     ReloadConfig,
 }
 
@@ -40,6 +49,8 @@ struct Daemon {
     region_id: Option<u32>,
     full_id: Option<u32>,
     initialized: bool,
+    /// When the last left-click-triggered Start-window spawn happened (debounce).
+    last_tray_open: Option<Instant>,
 }
 
 impl Daemon {
@@ -100,6 +111,29 @@ impl Daemon {
             config.hotkey_full
         );
     }
+
+    /// Left-click on the tray icon opens the Start window (same action as the
+    /// "Открыть окно запуска" menu item). Debounced so a stray double-fire of
+    /// the underlying Down/Up events doesn't spawn two processes.
+    fn handle_tray_event(&mut self, ev: tray_icon::TrayIconEvent) {
+        let tray_icon::TrayIconEvent::Click {
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } = ev
+        else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .last_tray_open
+            .is_some_and(|t| now.duration_since(t) < TRAY_CLICK_DEBOUNCE)
+        {
+            return;
+        }
+        self.last_tray_open = Some(now);
+        self.spawn_ui("--start");
+    }
 }
 
 impl ApplicationHandler<UserEvent> for Daemon {
@@ -139,6 +173,7 @@ impl ApplicationHandler<UserEvent> for Daemon {
                     self.spawn_ui("--capture-full");
                 }
             }
+            UserEvent::Tray(ev) => self.handle_tray_event(ev),
             UserEvent::ReloadConfig => self.reload(),
         }
     }
@@ -173,6 +208,10 @@ pub fn run() {
             let _ = hk_proxy.send_event(UserEvent::Hotkey(e.id));
         }
     }));
+    let tray_proxy = proxy.clone();
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        let _ = tray_proxy.send_event(UserEvent::Tray(e));
+    }));
 
     // Blocked helper thread: wakes only when the settings process signals the
     // reload event, then asks the loop to re-read the config.
@@ -184,6 +223,7 @@ pub fn run() {
         region_id: None,
         full_id: None,
         initialized: false,
+        last_tray_open: None,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("tray event loop error: {e}");

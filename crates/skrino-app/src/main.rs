@@ -28,6 +28,22 @@ use app::{LaunchMode, SkrinoApp};
 use config::AppConfig;
 use egui::Vec2;
 
+/// The app icon (golden low-poly rhino head, transparent background). Also
+/// decoded for the tray icon (see `tray.rs`) and baked into `assets/skrino.ico`
+/// for the exe resource (see `build.rs` / `examples/gen_ico.rs`).
+static ICON_PNG_BYTES: &[u8] = include_bytes!("../assets/mini-skrino.png");
+
+/// Decode [`ICON_PNG_BYTES`] into egui's window-icon format.
+fn load_window_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(ICON_PNG_BYTES).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -55,12 +71,15 @@ fn main() {
         _ => Vec2::new(420.0, 392.0),
     };
 
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title("Skrino")
         .with_inner_size(initial_size)
         .with_min_inner_size([360.0, 300.0])
         .with_resizable(true)
         .with_visible(start_visible);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
 
     let options = eframe::NativeOptions {
         viewport,

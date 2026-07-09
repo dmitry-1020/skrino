@@ -13,10 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use egui::{
-    Color32, CornerRadius, FontId, Pos2, RichText, Sense, Stroke, Vec2, ViewportCommand,
-    WindowLevel,
-};
+use egui::{CornerRadius, Pos2, RichText, Sense, Stroke, Vec2, ViewportCommand, WindowLevel};
 use egui_phosphor::regular as ph;
 use image::RgbaImage;
 use skrino_capture::{MonitorInfo, VirtualScreenCapture};
@@ -34,8 +31,14 @@ use crate::toast::{ToastAction, Toasts};
 pub const START_SIZE: Vec2 = Vec2::new(420.0, 392.0);
 /// Editor window default size.
 const EDITOR_SIZE: Vec2 = Vec2::new(1120.0, 780.0);
-/// Settings-window host size (fits the settings dialog).
-const SETTINGS_SIZE: Vec2 = Vec2::new(540.0, 620.0);
+/// Settings-window host size (full-window settings content, see item 5).
+const SETTINGS_SIZE: Vec2 = Vec2::new(540.0, 640.0);
+
+/// The Start-window hero image: rhino + "SKRINO" wordmark.
+static HERO_PNG_BYTES: &[u8] = include_bytes!("../assets/skrino.png");
+/// Displayed width of the hero image (logical points); height follows the
+/// source's aspect ratio.
+const HERO_WIDTH: f32 = 150.0;
 /// Hard cap on how long a window-close waits for an in-flight share to finish
 /// before the process exits anyway (see [`SkrinoApp::handle_close_request`]).
 const SHARE_CLOSE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -101,6 +104,8 @@ pub struct SkrinoApp {
     /// Hard deadline for a deferred close: the process exits at this instant
     /// even if the upload never reports back.
     close_deadline: Option<Instant>,
+    /// The Start-window hero image, decoded once and reused every frame.
+    hero_texture: Option<egui::TextureHandle>,
 }
 
 impl SkrinoApp {
@@ -108,6 +113,7 @@ impl SkrinoApp {
         cc.egui_ctx.set_fonts(theme::build_fonts());
         theme::apply(&cc.egui_ctx, config.theme);
         let applied_theme = Some(config.theme);
+        let hero_texture = load_hero_texture(&cc.egui_ctx);
 
         Self {
             config,
@@ -121,6 +127,7 @@ impl SkrinoApp {
             pending_share: None,
             pending_close: false,
             close_deadline: None,
+            hero_texture,
         }
     }
 
@@ -222,12 +229,6 @@ impl SkrinoApp {
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::process::Command::new(exe).arg("--tray").spawn();
         }
-    }
-
-    /// «Работать в фоне»: settle into the tray and exit this UI process.
-    fn go_background(&mut self) -> ! {
-        self.settle_into_background();
-        std::process::exit(0);
     }
 
     // --- editor actions ---
@@ -507,13 +508,23 @@ impl SkrinoApp {
         }
     }
 
-    fn apply_window_mode(ctx: &egui::Context, mode: &WindowMode) {
+    fn apply_window_mode(&self, ctx: &egui::Context, mode: &WindowMode) {
         let send = |c| ctx.send_viewport_cmd(c);
         match mode {
             WindowMode::Hidden => send(ViewportCommand::Visible(false)),
-            WindowMode::Start => windowed(ctx, START_SIZE),
-            WindowMode::Editor => windowed(ctx, EDITOR_SIZE),
-            WindowMode::Settings => windowed(ctx, SETTINGS_SIZE),
+            WindowMode::Start => windowed(ctx, START_SIZE, "Skrino"),
+            WindowMode::Editor => windowed(ctx, EDITOR_SIZE, "Skrino"),
+            WindowMode::Settings => {
+                // The standalone `--settings` process gets its own title; the
+                // Start window keeps "Skrino" while it's showing settings
+                // embedded in the same root window.
+                let title = if matches!(self.launch, LaunchMode::Settings) {
+                    "Skrino: Настройки"
+                } else {
+                    "Skrino"
+                };
+                windowed(ctx, SETTINGS_SIZE, title);
+            }
             WindowMode::Overlay { pos, size } => {
                 send(ViewportCommand::Decorations(false));
                 send(ViewportCommand::Resizable(false));
@@ -535,21 +546,29 @@ impl SkrinoApp {
         match &mut state {
             AppState::Boot => {}
             AppState::SettingsOnly => {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(palette.window))
-                    .show(ctx, |_ui| {});
+                // The standalone `--settings` process: the root window IS the
+                // settings screen, no separate Start content underneath.
+                let res = self.settings.show(ctx, &mut self.config, palette);
+                self.handle_settings_result(res);
+            }
+            AppState::Start if self.settings.open => {
+                // «Настройки» from the Start window swaps the root window's
+                // content for the settings screen (see `settings_ui` module
+                // docs) instead of opening a floating window on top of it.
+                let res = self.settings.show(ctx, &mut self.config, palette);
+                self.handle_settings_result(res);
             }
             AppState::Start => match draw_start(
                 ctx,
                 palette,
                 !self.config.configured,
                 &self.config.hotkey,
+                self.hero_texture.as_ref(),
             ) {
                 StartSignal::Region => next = Some(self.begin_region_capture(false)),
                 StartSignal::Full => next = Some(self.begin_full_capture()),
                 StartSignal::Open => next = Some(self.begin_open_file()),
                 StartSignal::Settings => self.settings.open = true,
-                StartSignal::Background => self.go_background(),
                 StartSignal::None => {}
             },
             AppState::Editor(ed) => {
@@ -655,16 +674,12 @@ impl eframe::App for SkrinoApp {
         // Reshape the root window only on state transitions.
         let wanted = self.window_mode_for_state();
         if self.applied_window.as_ref() != Some(&wanted) {
-            Self::apply_window_mode(ctx, &wanted);
+            self.apply_window_mode(ctx, &wanted);
             self.applied_window = Some(wanted);
         }
 
         self.draw_main(ctx, &palette);
 
-        if self.settings.open {
-            let res = self.settings.show(ctx, &mut self.config, &palette);
-            self.handle_settings_result(res);
-        }
         // Settings-only launch exits when its window closes.
         if matches!(self.launch, LaunchMode::Settings) && !self.settings.open {
             self.quit();
@@ -700,14 +715,23 @@ impl eframe::App for SkrinoApp {
     }
 }
 
-/// Restore standard windowed chrome at `size` (decorations, normal level, not
-/// fullscreen, visible, focused).
-fn windowed(ctx: &egui::Context, size: Vec2) {
+/// Decode the Start-window hero PNG into a texture, once.
+fn load_hero_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(HERO_PNG_BYTES).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture("skrino_hero", color, egui::TextureOptions::LINEAR))
+}
+
+/// Restore standard windowed chrome at `size` with `title` (decorations,
+/// normal level, not fullscreen, visible, focused).
+fn windowed(ctx: &egui::Context, size: Vec2, title: &str) {
     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
     ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
     ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
     ctx.send_viewport_cmd(ViewportCommand::Resizable(true));
     ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+    ctx.send_viewport_cmd(ViewportCommand::Title(title.to_owned()));
     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(ViewportCommand::Focus);
 }
@@ -816,7 +840,6 @@ enum StartSignal {
     Full,
     Open,
     Settings,
-    Background,
 }
 
 fn draw_start(
@@ -824,6 +847,7 @@ fn draw_start(
     palette: &Palette,
     first_run: bool,
     hotkey: &str,
+    hero: Option<&egui::TextureHandle>,
 ) -> StartSignal {
     let mut sig = StartSignal::None;
     egui::CentralPanel::default()
@@ -831,21 +855,17 @@ fn draw_start(
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
-                ui.label(
-                    RichText::new("Skrino")
-                        .font(theme::heading_font(30.0))
-                        .color(palette.text),
-                );
+                if let Some(tex) = hero {
+                    let size = tex.size_vec2();
+                    let aspect = if size.x > 0.0 { size.y / size.x } else { 1.0 };
+                    let draw_size = Vec2::new(HERO_WIDTH, HERO_WIDTH * aspect);
+                    ui.add(egui::Image::new((tex.id(), draw_size)));
+                }
                 ui.label(
                     RichText::new("Быстрые скриншоты")
                         .size(13.0)
                         .color(palette.text_secondary),
                 );
-                ui.add_space(16.0);
-
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(240.0, 96.0), Sense::hover());
-                draw_illustration(ui.painter(), rect, palette);
-
                 ui.add_space(18.0);
                 let cards_width = 3.0 * MODE_CARD_SIZE.x + 2.0 * 8.0;
                 let pad = ((ui.available_width() - cards_width) / 2.0).max(0.0);
@@ -865,7 +885,7 @@ fn draw_start(
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let row = ui.available_width();
-                    let btns = 260.0;
+                    let btns = 110.0;
                     ui.add_space(((row - btns) / 2.0).max(0.0));
                     if ui
                         .add(
@@ -880,21 +900,6 @@ fn draw_start(
                     {
                         sig = StartSignal::Settings;
                     }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(format!("{}  Работать в фоне", ph::TRAY))
-                                    .color(palette.text_secondary)
-                                    .size(13.0),
-                            )
-                            .frame(false),
-                        )
-                        .on_hover_text("Свернуть в трей: горячая клавиша и меню будут доступны")
-                        .clicked()
-                    {
-                        sig = StartSignal::Background;
-                    }
                 });
 
                 // First-run hint: explain that Skrino keeps living in the tray.
@@ -908,7 +913,7 @@ fn draw_start(
                     ui.add(
                         egui::Label::new(
                             RichText::new(format!(
-                                "Skrino будет работать в фоне — иконка в трее, скриншот по {hk}"
+                                "Skrino будет работать в фоне: иконка в трее, скриншот по {hk}"
                             ))
                             .size(12.0)
                             .color(palette.text_secondary),
@@ -935,7 +940,7 @@ fn mode_card(
     let (fill, fg, stroke) = if primary {
         (
             if resp.hovered() { palette.accent_hover } else { palette.accent },
-            Color32::WHITE,
+            palette.accent_fg,
             Stroke::NONE,
         )
     } else {
@@ -962,53 +967,6 @@ fn mode_card(
         fg,
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// A stylised dashed selection marquee for the launcher.
-fn draw_illustration(painter: &egui::Painter, area: egui::Rect, palette: &Palette) {
-    let rect = egui::Rect::from_center_size(area.center(), Vec2::new(150.0, 78.0));
-    let dash = 8.0;
-    let gap = 5.0;
-    let stroke = Stroke::new(2.0, palette.accent);
-
-    let dashed = |a: Pos2, b: Pos2| {
-        let len = (b - a).length();
-        let dir = (b - a).normalized();
-        let mut t = 0.0;
-        while t < len {
-            let s = a + dir * t;
-            let e = a + dir * (t + dash).min(len);
-            painter.line_segment([s, e], stroke);
-            t += dash + gap;
-        }
-    };
-    dashed(rect.left_top(), rect.right_top());
-    dashed(rect.right_top(), rect.right_bottom());
-    dashed(rect.right_bottom(), rect.left_bottom());
-    dashed(rect.left_bottom(), rect.left_top());
-
-    // Corner handles.
-    for c in [
-        rect.left_top(),
-        rect.right_top(),
-        rect.left_bottom(),
-        rect.right_bottom(),
-    ] {
-        painter.rect_filled(
-            egui::Rect::from_center_size(c, Vec2::splat(7.0)),
-            CornerRadius::same(2),
-            palette.accent,
-        );
-    }
-
-    // Faint dimensions badge inside.
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "1280 × 720",
-        FontId::proportional(13.0),
-        palette.text_secondary,
-    );
 }
 
 /// Encode the rendered image to PNG or JPEG bytes.

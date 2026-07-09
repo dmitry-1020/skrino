@@ -51,6 +51,6 @@ mod tests {
     #[test]
     #[ignore]
     fn fires_a_real_toast() {
-        show("Skrino: тест уведомлений", "Если видно — работает").expect("toast failed");
+        show("Skrino: тест уведомлений", "Если видно, значит работает").expect("toast failed");
     }
 }

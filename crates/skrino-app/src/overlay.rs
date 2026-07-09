@@ -226,7 +226,7 @@ impl OverlayState {
                 draw_hint(
                     &painter,
                     hint_pos,
-                    "Выделите область  •  Esc или правый клик — отмена",
+                    "Выделите область  •  Esc или правый клик: отмена",
                     palette,
                 );
 
@@ -240,9 +240,11 @@ impl OverlayState {
                     let btn_rect = Rect::from_min_size(btn_pos, btn_size);
                     let ok = ui.put(
                         btn_rect,
-                        egui::Button::new(egui::RichText::new("ОК").color(Color32::WHITE).strong())
-                            .fill(palette.accent)
-                            .corner_radius(CornerRadius::same(8)),
+                        egui::Button::new(
+                            egui::RichText::new("ОК").color(palette.accent_fg).strong(),
+                        )
+                        .fill(palette.accent)
+                        .corner_radius(CornerRadius::same(8)),
                     );
                     if ok.clicked() {
                         result = self.confirm();
@@ -303,11 +305,11 @@ fn draw_handles(painter: &egui::Painter, r: Rect, accent: Color32) {
 
 fn draw_badge(painter: &egui::Painter, pos: Pos2, text: &str, palette: &Palette) {
     let font = FontId::proportional(13.0);
-    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
+    let galley = painter.layout_no_wrap(text.to_string(), font, palette.accent_fg);
     let pad = Vec2::new(8.0, 4.0);
     let rect = Rect::from_min_size(pos, galley.size() + pad * 2.0);
     painter.rect_filled(rect, CornerRadius::same(6), palette.accent);
-    painter.galley(pos + pad, galley, Color32::WHITE);
+    painter.galley(pos + pad, galley, palette.accent_fg);
 }
 
 fn draw_hint(painter: &egui::Painter, center: Pos2, text: &str, palette: &Palette) {

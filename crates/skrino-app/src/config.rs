@@ -342,6 +342,9 @@ mod tests {
     use super::*;
 
     #[test]
+    // Reassigning fields one-by-one (rather than a giant struct literal) keeps
+    // this test readable as a checklist of "every field round-trips".
+    #[allow(clippy::field_reassign_with_default)]
     fn config_round_trips_through_json() {
         let mut cfg = AppConfig::default();
         cfg.theme = Theme::Light;

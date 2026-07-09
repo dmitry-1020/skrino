@@ -47,12 +47,12 @@ impl Tray {
         ])
         .map_err(|e| e.to_string())?;
 
-        let (rgba, w, h) = make_icon_rgba();
+        let (rgba, w, h) = load_icon_rgba();
         let icon = Icon::from_rgba(rgba, w, h).map_err(|e| e.to_string())?;
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Skrino — скриншоты")
+            .with_tooltip("Skrino: скриншоты")
             .with_icon(icon)
             .build()
             .map_err(|e| e.to_string())?;
@@ -112,57 +112,21 @@ fn full_label(hotkey: &str) -> String {
     }
 }
 
-/// A 32×32 tray icon: accent rounded square with white corner brackets
-/// suggesting a selection marquee. Generated so we don't ship a binary asset.
-fn make_icon_rgba() -> (Vec<u8>, u32, u32) {
-    const S: usize = 32;
-    let accent = [0x35u8, 0x74, 0xF0, 0xFF];
-    let white = [0xFFu8, 0xFF, 0xFF, 0xFF];
-    let clear = [0u8, 0, 0, 0];
-    let mut buf = vec![0u8; S * S * 4];
+/// The brand tray icon: `mini-skrino.png` (golden low-poly rhino head,
+/// transparent background), decoded and resized to a crisp tray size.
+static TRAY_ICON_PNG_BYTES: &[u8] = include_bytes!("../assets/mini-skrino.png");
+const TRAY_ICON_SIZE: u32 = 32;
 
-    let put = |buf: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
-        let i = (y * S + x) * 4;
-        buf[i..i + 4].copy_from_slice(&c);
-    };
-
-    // Rounded-square background.
-    let r: f32 = 7.0;
-    for y in 0..S {
-        for x in 0..S {
-            let inside = rounded_inside(x as f32, y as f32, S as f32, r);
-            put(&mut buf, x, y, if inside { accent } else { clear });
-        }
-    }
-
-    // White corner brackets (marquee look).
-    let lo = 9;
-    let hi = 22;
-    let arm = 5;
-    for t in 0..=arm {
-        // top-left
-        put(&mut buf, lo + t, lo, white);
-        put(&mut buf, lo, lo + t, white);
-        // top-right
-        put(&mut buf, hi - t, lo, white);
-        put(&mut buf, hi, lo + t, white);
-        // bottom-left
-        put(&mut buf, lo + t, hi, white);
-        put(&mut buf, lo, hi - t, white);
-        // bottom-right
-        put(&mut buf, hi - t, hi, white);
-        put(&mut buf, hi, hi - t, white);
-    }
-
-    (buf, S as u32, S as u32)
-}
-
-/// Is pixel (x,y) inside a rounded square of side `s` with corner radius `r`?
-fn rounded_inside(x: f32, y: f32, s: f32, r: f32) -> bool {
-    let (px, py) = (x + 0.5, y + 0.5);
-    let cx = px.clamp(r, s - r);
-    let cy = py.clamp(r, s - r);
-    let dx = px - cx;
-    let dy = py - cy;
-    dx * dx + dy * dy <= r * r + 0.5
+/// Decode and resize the brand icon for the system tray, preserving alpha.
+fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
+    let img = image::load_from_memory(TRAY_ICON_PNG_BYTES)
+        .expect("bundled tray icon PNG must decode")
+        .to_rgba8();
+    let resized = image::imageops::resize(
+        &img,
+        TRAY_ICON_SIZE,
+        TRAY_ICON_SIZE,
+        image::imageops::FilterType::Lanczos3,
+    );
+    (resized.into_raw(), TRAY_ICON_SIZE, TRAY_ICON_SIZE)
 }
