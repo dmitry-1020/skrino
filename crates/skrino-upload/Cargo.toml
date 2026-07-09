@@ -1,0 +1,22 @@
+[package]
+name = "skrino-upload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+log.workspace = true
+# FTP / FTPS (rustls to avoid a C TLS dependency)
+suppaftp = { version = "6", features = ["rustls"] }
+# SFTP over SSH — pure Rust. Default features pull in aws-lc-rs, whose
+# aws-lc-sys build requires NASM (and a release-style OPT_LEVEL to skip it),
+# neither of which is guaranteed on a dev box; use the "ring" crypto backend
+# instead, which this workspace already builds successfully via rustls.
+russh = { version = "0.54", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "2"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+rand = "0.9"
+chrono = "0.4"

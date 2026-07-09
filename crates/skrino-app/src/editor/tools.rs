@@ -1,0 +1,389 @@
+//! Pure geometry helpers for the editor: drawing annotations with an egui
+//! painter, hit-testing, and translating shapes. No UI state here.
+
+use egui::{Color32, CornerRadius, FontId, Pos2, Shape, Stroke, StrokeKind, Vec2, epaint::PathStroke};
+use skrino_core::{Annotation, ArrowHead, Color, Point, Rect as CRect};
+
+use super::c32;
+use crate::theme::Palette;
+use crate::transform::CanvasTransform;
+
+const SELECT_TOL_IMG: f32 = 6.0;
+
+/// Draw one annotation onto the canvas. `Blur` is skipped here — the canvas
+/// draws its pixelation preview separately (below the vector layer).
+pub fn draw_annotation(
+    painter: &egui::Painter,
+    t: &CanvasTransform,
+    ann: &Annotation,
+    palette: &Palette,
+) {
+    match ann {
+        Annotation::Arrow {
+            from,
+            to,
+            head,
+            style,
+        } => {
+            let a = t.image_to_screen(*from);
+            let b = t.image_to_screen(*to);
+            let w = t.len_to_screen(style.thickness).max(1.0);
+            let stroke = Stroke::new(w, c32(style.color));
+            painter.line_segment([a, b], stroke);
+            draw_arrow_head(painter, a, b, w, style.color, *head);
+        }
+        Annotation::Line { from, to, style } => {
+            let a = t.image_to_screen(*from);
+            let b = t.image_to_screen(*to);
+            let w = t.len_to_screen(style.thickness).max(1.0);
+            painter.line_segment([a, b], Stroke::new(w, c32(style.color)));
+        }
+        Annotation::Rect { rect, style, fill } => {
+            let r = t.image_rect_to_screen(*rect);
+            let w = t.len_to_screen(style.thickness).max(1.0);
+            if let Some(f) = fill {
+                painter.rect_filled(r, CornerRadius::same(2), c32(*f));
+            }
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(2),
+                Stroke::new(w, c32(style.color)),
+                StrokeKind::Middle,
+            );
+        }
+        Annotation::Ellipse { rect, style, fill } => {
+            let r = t.image_rect_to_screen(*rect);
+            let pts = ellipse_points(r, 48);
+            let w = t.len_to_screen(style.thickness).max(1.0);
+            if let Some(f) = fill {
+                painter.add(Shape::convex_polygon(pts.clone(), c32(*f), Stroke::NONE));
+            }
+            painter.add(Shape::closed_line(pts, Stroke::new(w, c32(style.color))));
+        }
+        Annotation::Text {
+            pos,
+            content,
+            size,
+            color,
+            background,
+        } => {
+            let p = t.image_to_screen(*pos);
+            let font = FontId::proportional((size * t.zoom).max(6.0));
+            let galley = painter.layout_no_wrap(content.clone(), font, c32(*color));
+            if let Some(bg) = background {
+                let pad = Vec2::new(6.0, 3.0) * t.zoom.max(0.3);
+                let rect = egui::Rect::from_min_size(p - pad, galley.size() + pad * 2.0);
+                painter.rect_filled(rect, CornerRadius::same(4), c32(*bg));
+            }
+            painter.galley(p, galley, c32(*color));
+        }
+        Annotation::Marker { points, style } => {
+            let pts = map_points(t, points);
+            let w = (style.thickness * t.zoom * 1.6).max(2.0);
+            // Highlighter: translucent, rounded.
+            let mut mc = style.color;
+            mc.a = 110;
+            if pts.len() >= 2 {
+                painter.add(Shape::line(pts, PathStroke::new(w, c32(mc))));
+            }
+        }
+        Annotation::Pen { points, style } => {
+            let pts = map_points(t, points);
+            let w = t.len_to_screen(style.thickness).max(1.0);
+            if pts.len() >= 2 {
+                painter.add(Shape::line(pts, PathStroke::new(w, c32(style.color))));
+            } else if let Some(p) = pts.first() {
+                painter.circle_filled(*p, w * 0.5, c32(style.color));
+            }
+        }
+        Annotation::Blur { .. } => {
+            // Preview drawn by the canvas layer.
+        }
+        Annotation::Counter {
+            pos,
+            number,
+            radius,
+            color,
+        } => {
+            let p = t.image_to_screen(*pos);
+            let r = (radius * t.zoom).max(6.0);
+            painter.circle_filled(p, r, c32(*color));
+            painter.circle_stroke(p, r, Stroke::new((1.0 * t.zoom).max(1.0), Color32::WHITE));
+            let font = FontId::new(r * 1.05, egui::FontFamily::Name(crate::theme::HEADING_FAMILY.into()));
+            let _ = palette;
+            painter.text(
+                p,
+                egui::Align2::CENTER_CENTER,
+                number.to_string(),
+                font,
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+/// Outline a selected annotation with a subtle accent rectangle.
+pub fn draw_selection_outline(
+    painter: &egui::Painter,
+    t: &CanvasTransform,
+    ann: &Annotation,
+    palette: &Palette,
+) {
+    let Some(bb) = bounding_box(ann) else { return };
+    let mut r = t.image_rect_to_screen(bb);
+    r = r.expand(4.0);
+    painter.rect_stroke(
+        r,
+        CornerRadius::same(4),
+        Stroke::new(1.5, palette.accent),
+        StrokeKind::Outside,
+    );
+}
+
+fn map_points(t: &CanvasTransform, points: &[Point]) -> Vec<Pos2> {
+    points.iter().map(|p| t.image_to_screen(*p)).collect()
+}
+
+fn draw_arrow_head(
+    painter: &egui::Painter,
+    from: Pos2,
+    to: Pos2,
+    width: f32,
+    color: Color,
+    head: ArrowHead,
+) {
+    let dir = (to - from).normalized();
+    if !dir.is_finite() || dir == Vec2::ZERO {
+        return;
+    }
+    let len = (width * 3.5).max(10.0);
+    let perp = Vec2::new(-dir.y, dir.x);
+    let base = to - dir * len;
+    let left = base + perp * len * 0.5;
+    let right = base - perp * len * 0.5;
+    match head {
+        ArrowHead::Filled => {
+            painter.add(Shape::convex_polygon(
+                vec![to, left, right],
+                c32(color),
+                Stroke::NONE,
+            ));
+        }
+        ArrowHead::Open => {
+            let s = Stroke::new(width, c32(color));
+            painter.line_segment([to, left], s);
+            painter.line_segment([to, right], s);
+        }
+    }
+}
+
+fn ellipse_points(r: egui::Rect, segments: usize) -> Vec<Pos2> {
+    let c = r.center();
+    let (rx, ry) = (r.width() * 0.5, r.height() * 0.5);
+    (0..segments)
+        .map(|i| {
+            let a = i as f32 / segments as f32 * std::f32::consts::TAU;
+            Pos2::new(c.x + rx * a.cos(), c.y + ry * a.sin())
+        })
+        .collect()
+}
+
+// --- hit-testing & translation (image space) ---
+
+/// Topmost annotation under `p` (image px), if any.
+pub fn hit_test(anns: &[Annotation], p: Point) -> Option<usize> {
+    for (i, ann) in anns.iter().enumerate().rev() {
+        if hits(ann, p) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn hits(ann: &Annotation, p: Point) -> bool {
+    let tol = SELECT_TOL_IMG;
+    match ann {
+        Annotation::Arrow { from, to, .. } | Annotation::Line { from, to, .. } => {
+            point_seg_dist(p, *from, *to) <= tol
+        }
+        Annotation::Rect { rect, fill, .. } => {
+            if fill.is_some() && rect.contains(p) {
+                true
+            } else {
+                near_rect_border(*rect, p, tol)
+            }
+        }
+        Annotation::Ellipse { rect, fill, .. } => {
+            if fill.is_some() && rect.contains(p) {
+                return true;
+            }
+            // Near the border: check normalised radius close to 1.
+            let cx = (rect.min.x + rect.max.x) * 0.5;
+            let cy = (rect.min.y + rect.max.y) * 0.5;
+            let rx = (rect.width() * 0.5).max(1.0);
+            let ry = (rect.height() * 0.5).max(1.0);
+            let nx = (p.x - cx) / rx;
+            let ny = (p.y - cy) / ry;
+            let d = (nx * nx + ny * ny).sqrt();
+            (d - 1.0).abs() < 0.15
+        }
+        Annotation::Text { pos, content, size, .. } => {
+            let w = content.chars().count() as f32 * size * 0.55;
+            let r = CRect::from_points(*pos, Point::new(pos.x + w.max(*size), pos.y + size * 1.2));
+            r.contains(p)
+        }
+        Annotation::Marker { points, .. } | Annotation::Pen { points, .. } => {
+            points.windows(2).any(|w| point_seg_dist(p, w[0], w[1]) <= tol.max(4.0))
+        }
+        Annotation::Blur { rect, .. } => rect.contains(p),
+        Annotation::Counter { pos, radius, .. } => {
+            let dx = p.x - pos.x;
+            let dy = p.y - pos.y;
+            (dx * dx + dy * dy).sqrt() <= *radius
+        }
+    }
+}
+
+fn near_rect_border(r: CRect, p: Point, tol: f32) -> bool {
+    let inside = r.contains(p);
+    let inner = CRect {
+        min: Point::new(r.min.x + tol, r.min.y + tol),
+        max: Point::new(r.max.x - tol, r.max.y - tol),
+    };
+    let strict_inside = inner.max.x > inner.min.x
+        && inner.max.y > inner.min.y
+        && inner.contains(p);
+    // Within tol of the outer edge too.
+    let near_outer = p.x >= r.min.x - tol
+        && p.x <= r.max.x + tol
+        && p.y >= r.min.y - tol
+        && p.y <= r.max.y + tol;
+    (inside || near_outer) && !strict_inside
+}
+
+/// Bounding box of an annotation in image space.
+pub fn bounding_box(ann: &Annotation) -> Option<CRect> {
+    match ann {
+        Annotation::Arrow { from, to, .. } | Annotation::Line { from, to, .. } => {
+            Some(CRect::from_points(*from, *to))
+        }
+        Annotation::Rect { rect, .. }
+        | Annotation::Ellipse { rect, .. }
+        | Annotation::Blur { rect, .. } => Some(*rect),
+        Annotation::Text { pos, content, size, .. } => {
+            let w = (content.chars().count() as f32 * size * 0.55).max(*size);
+            Some(CRect::from_points(
+                *pos,
+                Point::new(pos.x + w, pos.y + size * 1.2),
+            ))
+        }
+        Annotation::Marker { points, .. } | Annotation::Pen { points, .. } => {
+            bbox_of_points(points)
+        }
+        Annotation::Counter { pos, radius, .. } => Some(CRect {
+            min: Point::new(pos.x - radius, pos.y - radius),
+            max: Point::new(pos.x + radius, pos.y + radius),
+        }),
+    }
+}
+
+fn bbox_of_points(points: &[Point]) -> Option<CRect> {
+    let first = points.first()?;
+    let mut min = *first;
+    let mut max = *first;
+    for p in points {
+        min.x = min.x.min(p.x);
+        min.y = min.y.min(p.y);
+        max.x = max.x.max(p.x);
+        max.y = max.y.max(p.y);
+    }
+    Some(CRect { min, max })
+}
+
+/// Translate every point of an annotation by `(dx, dy)` image pixels.
+pub fn translate(ann: &mut Annotation, dx: f32, dy: f32) {
+    let shift = |p: &mut Point| {
+        p.x += dx;
+        p.y += dy;
+    };
+    let shift_rect = |r: &mut CRect| {
+        r.min.x += dx;
+        r.min.y += dy;
+        r.max.x += dx;
+        r.max.y += dy;
+    };
+    match ann {
+        Annotation::Arrow { from, to, .. } | Annotation::Line { from, to, .. } => {
+            shift(from);
+            shift(to);
+        }
+        Annotation::Rect { rect, .. }
+        | Annotation::Ellipse { rect, .. }
+        | Annotation::Blur { rect, .. } => shift_rect(rect),
+        Annotation::Text { pos, .. } | Annotation::Counter { pos, .. } => shift(pos),
+        Annotation::Marker { points, .. } | Annotation::Pen { points, .. } => {
+            for p in points {
+                shift(p);
+            }
+        }
+    }
+}
+
+fn point_seg_dist(p: Point, a: Point, b: Point) -> f32 {
+    let (abx, aby) = (b.x - a.x, b.y - a.y);
+    let (apx, apy) = (p.x - a.x, p.y - a.y);
+    let len2 = abx * abx + aby * aby;
+    if len2 <= f32::EPSILON {
+        return (apx * apx + apy * apy).sqrt();
+    }
+    let t = ((apx * abx + apy * aby) / len2).clamp(0.0, 1.0);
+    let cx = a.x + t * abx;
+    let cy = a.y + t * aby;
+    ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skrino_core::Style;
+
+    #[test]
+    fn hit_test_picks_topmost_line() {
+        let style = Style {
+            color: Color::rgb(0, 0, 0),
+            thickness: 2.0,
+        };
+        let anns = vec![
+            Annotation::Line {
+                from: Point::new(0.0, 0.0),
+                to: Point::new(100.0, 0.0),
+                style,
+            },
+            Annotation::Line {
+                from: Point::new(0.0, 0.0),
+                to: Point::new(0.0, 100.0),
+                style,
+            },
+        ];
+        // Near the vertical (index 1, drawn last => topmost).
+        assert_eq!(hit_test(&anns, Point::new(1.0, 50.0)), Some(1));
+        // Off both lines.
+        assert_eq!(hit_test(&anns, Point::new(80.0, 80.0)), None);
+    }
+
+    #[test]
+    fn translate_moves_counter() {
+        let mut a = Annotation::Counter {
+            pos: Point::new(10.0, 20.0),
+            number: 1,
+            radius: 12.0,
+            color: Color::rgb(1, 2, 3),
+        };
+        translate(&mut a, 5.0, -4.0);
+        if let Annotation::Counter { pos, .. } = a {
+            assert_eq!((pos.x, pos.y), (15.0, 16.0));
+        } else {
+            panic!("wrong variant");
+        }
+    }
+}

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/skrino-core",
+    "crates/skrino-capture",
+    "crates/skrino-upload",
+    "crates/skrino-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+log = "0.4"
+
+# Fast, small release binary
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Annotations rendering must be smooth even in debug builds
+[profile.dev.package."*"]
+opt-level = 2
