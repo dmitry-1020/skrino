@@ -439,13 +439,14 @@ fn draw_arrow(
             let half_w = (head_len * 0.5).max(t * 0.5 + 1.0);
             let bcx = to.x - ux * head_len;
             let bcy = to.y - uy * head_len;
-            // Shaft ends short of the head base by the round-cap radius
-            // (t/2) so the cap stays fully hidden under the triangle instead
-            // of bulging past its base edges. Degenerate/short arrows (where
-            // even that pulled-back point would land behind `from`) skip the
+            // The shaft endpoint sits t/2 INSIDE the head (past its base), so
+            // the round end cap tucks fully under the triangle: the cap's
+            // rearmost point lands exactly on the base line (seamless joint,
+            // no notch), and near the base the triangle is wider than the
+            // shaft, so nothing bulges past its edges. Degenerate/short
+            // arrows (where that point would land behind `from`) skip the
             // shaft and draw the head only.
-            let pullback = head_len + t * 0.5;
-            let shaft_len = len - pullback;
+            let shaft_len = len - head_len + t * 0.5;
             if shaft_len > 0.0 {
                 let shaft_end_x = from.x + ux * shaft_len;
                 let shaft_end_y = from.y + uy * shaft_len;

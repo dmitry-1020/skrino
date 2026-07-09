@@ -158,14 +158,14 @@ fn draw_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: 
         ArrowHead::Filled | ArrowHead::Dashed => {
             // Head length ~3.5x thickness (min 10px), clamped to the arrow's
             // own length so it never overshoots a very short arrow. The
-            // shaft ends short of the head base by the round-cap radius
-            // (width/2) so the cap stays fully hidden under the triangle
-            // instead of bulging past its base edges; degenerate/short
-            // arrows (where even the pulled-back point lands behind `from`)
-            // skip the shaft and draw the head only.
+            // shaft endpoint sits width/2 INSIDE the head (past its base):
+            // egui strokes have flat ends, so stopping at or before the base
+            // leaves a visible gap; ending slightly inside makes the joint
+            // seamless while the triangle, wider than the shaft near its
+            // base, still covers the shaft end completely. Degenerate/short
+            // arrows skip the shaft and draw the head only.
             let head_len = (width * 3.5).max(10.0).min(len);
-            let pullback = head_len + width * 0.5;
-            let shaft_len = len - pullback;
+            let shaft_len = len - head_len + width * 0.5;
             if shaft_len > 0.0 {
                 let shaft_end = from + dir * shaft_len;
                 if matches!(head, ArrowHead::Dashed) {
