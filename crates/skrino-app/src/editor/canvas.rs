@@ -15,6 +15,12 @@ const POLY_MIN_DIST: f32 = 2.0;
 pub fn canvas_ui(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) {
     let canvas = ui.max_rect();
     state.canvas_rect = canvas;
+
+    // The rect (image-pixel space) actually visible this frame: an applied
+    // crop narrows it, drawing outside the screenshot expands it. See
+    // `EditorState::display_rect` for the exact rule.
+    let display = state.display_rect();
+
     if state.fit_pending {
         // The OS window resize that should precede this fit (opening the
         // editor, or reshaping in from the overlay) is asynchronous, so
@@ -24,7 +30,7 @@ pub fn canvas_ui(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) 
         // too-small canvas (previously showed the image at ~15% instead of
         // filling the window).
         if state.fit_stable_size == Some(canvas.size()) {
-            state.fit(canvas);
+            state.fit(canvas, display);
             state.fit_pending = false;
             state.fit_stable_size = None;
         } else {
@@ -39,18 +45,20 @@ pub fn canvas_ui(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) 
     refresh_blur_cache(state, ui.ctx());
 
     let t = state.transform();
-    let painter = ui.painter_at(canvas);
 
-    // --- backdrop: soft shadow + image ---
+    // Everything below except the crop overlay/controls and the text editor
+    // is clipped to `display` — that's what makes an applied crop actually
+    // crop the visible canvas instead of just tagging a rect for export.
+    let display_screen = t.image_rect_to_screen(display).intersect(canvas);
+    let painter = ui.painter_at(display_screen);
+
+    // --- backdrop: white canvas (matches the export background outside the
+    // screenshot, Task 4) + the screenshot image + a subtle image-edge border ---
+    painter.rect_filled(display_screen, CornerRadius::ZERO, Color32::WHITE);
     let img_rect = t.image_rect_to_screen(CRect::from_points(
         Point::new(0.0, 0.0),
         Point::new(state.img_w as f32, state.img_h as f32),
     ));
-    painter.rect_filled(
-        img_rect.expand(1.0),
-        CornerRadius::same(3),
-        Color32::from_black_alpha(60),
-    );
     if let Some(tex) = &state.texture {
         painter.image(
             tex.id(),
@@ -59,6 +67,7 @@ pub fn canvas_ui(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) 
             Color32::WHITE,
         );
     }
+    painter.rect_stroke(img_rect, CornerRadius::ZERO, Stroke::new(1.0, palette.border), StrokeKind::Middle);
 
     // --- blur previews (below the vector layer) ---
     for (rect, _sigma, tex) in &state.blur_cache {
@@ -137,9 +146,14 @@ fn dispatch_input(
     _canvas: egui::Rect,
 ) {
     let t = state.transform();
-    let ptr_img = response
-        .interact_pointer_pos()
-        .map(|p| state.clamp_img(t.screen_to_image(p)));
+    // Drawing gestures are allowed outside the screenshot (Task 4) — the
+    // canvas grows with white backing. Blur is the one exception: it only
+    // resamples base pixels, so its rect stays clamped to the image (the
+    // export renderer clamps it the same way).
+    let ptr_img = response.interact_pointer_pos().map(|p| {
+        let img = t.screen_to_image(p);
+        if state.tool == Tool::Blur { state.clamp_img(img) } else { img }
+    });
 
     match state.tool {
         Tool::Select => select_input(state, response, &t),
@@ -313,17 +327,10 @@ fn crop_overlay(
     canvas: egui::Rect,
     palette: &Palette,
 ) {
+    // While the Crop tool isn't active, an applied crop is already the whole
+    // visible canvas (see `display_rect`/`canvas_ui`), so there's nothing
+    // left to hint here.
     if state.tool != Tool::Crop {
-        // Still hint an applied crop with a dashed rectangle.
-        if let Some(crop) = state.doc.crop() {
-            let r = t.image_rect_to_screen(crop);
-            ui.painter_at(canvas).rect_stroke(
-                r,
-                CornerRadius::ZERO,
-                Stroke::new(1.5, palette.accent),
-                StrokeKind::Middle,
-            );
-        }
         return;
     }
 
@@ -338,12 +345,11 @@ fn crop_overlay(
 
     let sel = t.image_rect_to_screen(rect_img);
     let painter = ui.painter_at(canvas);
-    // Dim outside the crop rect (four bands).
+    // Dim outside the crop rect (four bands), across the full content extent
+    // (the Crop tool always shows everything — base image plus any
+    // annotations drawn beyond it — so a crop can include that area too).
     let dim = Color32::from_black_alpha(120);
-    let full = t.image_rect_to_screen(CRect::from_points(
-        Point::new(0.0, 0.0),
-        Point::new(state.img_w as f32, state.img_h as f32),
-    ));
+    let full = t.image_rect_to_screen(state.content_rect());
     for band in [
         egui::Rect::from_min_max(full.left_top(), Pos2::new(full.right(), sel.top())),
         egui::Rect::from_min_max(Pos2::new(full.left(), sel.bottom()), full.right_bottom()),
@@ -381,7 +387,12 @@ fn crop_overlay(
                     );
                     if apply.clicked() {
                         state.doc.set_crop(Some(rect_img));
-                        state.cancel_crop();
+                        // Leave the Crop tool so `display_rect` narrows to
+                        // the new crop immediately, then re-fit to it — this
+                        // is what makes Apply actually crop the visible
+                        // canvas instead of only affecting export.
+                        state.set_tool(Tool::Select);
+                        state.request_fit();
                     }
                     if cancel.clicked() {
                         state.cancel_crop();
@@ -586,6 +597,7 @@ impl EditorState {
 
     pub fn set_zoom_centered(&mut self, zoom: f32, canvas: egui::Rect) {
         self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        self.center(canvas);
+        let content = self.display_rect();
+        self.center(canvas, content);
     }
 }

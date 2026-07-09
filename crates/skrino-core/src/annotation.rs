@@ -70,10 +70,13 @@ pub struct Style {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArrowHead {
-    /// Classic filled triangle head.
+    /// Classic: straight solid shaft + filled triangle head.
     Filled,
-    /// Two-segment open head.
-    Open,
+    /// Same triangle head, but the shaft is dashed.
+    Dashed,
+    /// Tapered "Yandex-style" arrow: one smooth filled vector shape whose
+    /// shaft starts thin at the tail and widens into the head.
+    Tapered,
 }
 
 /// One vector annotation on top of the screenshot.

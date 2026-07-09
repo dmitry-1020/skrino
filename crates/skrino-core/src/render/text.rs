@@ -92,9 +92,7 @@ pub fn draw_line(
                 w,
                 px as u32,
                 py as u32,
-                color.r,
-                color.g,
-                color.b,
+                color,
                 (color.a as f32 / 255.0) * coverage,
             );
         });
@@ -130,19 +128,10 @@ pub fn measure_block(font: &FontRef, size: f32, text: &str) -> BlockMetrics {
     }
 }
 
-/// Blend a single straight-alpha color with coverage `alpha_f` (0..=1) onto the
-/// premultiplied RGBA pixel at `(x, y)` using source-over.
+/// Blend a single straight-alpha `color` with coverage `alpha_f` (0..=1) onto
+/// the premultiplied RGBA pixel at `(x, y)` using source-over.
 #[inline]
-pub fn blend_premult(
-    data: &mut [u8],
-    w: u32,
-    x: u32,
-    y: u32,
-    sr: u8,
-    sg: u8,
-    sb: u8,
-    alpha_f: f32,
-) {
+pub fn blend_premult(data: &mut [u8], w: u32, x: u32, y: u32, color: Color, alpha_f: f32) {
     let a = alpha_f.clamp(0.0, 1.0);
     if a <= 0.0 {
         return;
@@ -151,9 +140,9 @@ pub fn blend_premult(
     let idx = ((y * w + x) * 4) as usize;
     let inv = 255 - sa;
     // Premultiplied source channels.
-    let psr = (sr as u32 * sa + 127) / 255;
-    let psg = (sg as u32 * sa + 127) / 255;
-    let psb = (sb as u32 * sa + 127) / 255;
+    let psr = (color.r as u32 * sa + 127) / 255;
+    let psg = (color.g as u32 * sa + 127) / 255;
+    let psb = (color.b as u32 * sa + 127) / 255;
     let dr = data[idx] as u32;
     let dg = data[idx + 1] as u32;
     let db = data[idx + 2] as u32;

@@ -28,9 +28,7 @@ pub fn draw_annotation(
             let a = t.image_to_screen(*from);
             let b = t.image_to_screen(*to);
             let w = t.len_to_screen(style.thickness).max(1.0);
-            let stroke = Stroke::new(w, c32(style.color));
-            painter.line_segment([a, b], stroke);
-            draw_arrow_head(painter, a, b, w, style.color, *head);
+            draw_arrow(painter, a, b, w, style.color, *head);
         }
         Annotation::Line { from, to, style } => {
             let a = t.image_to_screen(*from);
@@ -144,37 +142,101 @@ fn map_points(t: &CanvasTransform, points: &[Point]) -> Vec<Pos2> {
     points.iter().map(|p| t.image_to_screen(*p)).collect()
 }
 
-fn draw_arrow_head(
-    painter: &egui::Painter,
-    from: Pos2,
-    to: Pos2,
-    width: f32,
-    color: Color,
-    head: ArrowHead,
-) {
+/// Draw one arrow annotation (shaft + head) matching `head`'s style. Mirrors
+/// `skrino_core::render`'s three `ArrowHead` variants so the live UI preview
+/// and committed annotations look the same as the exported PNG.
+fn draw_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: Color, head: ArrowHead) {
     let dir = (to - from).normalized();
     if !dir.is_finite() || dir == Vec2::ZERO {
+        // Degenerate (zero-length) arrow: draw a dot so something is visible.
+        painter.circle_filled(to, width.max(1.0) * 0.5, c32(color));
         return;
     }
-    let len = (width * 3.5).max(10.0);
-    let perp = Vec2::new(-dir.y, dir.x);
-    let base = to - dir * len;
-    let left = base + perp * len * 0.5;
-    let right = base - perp * len * 0.5;
+    let col = c32(color);
+    let len = (to - from).length();
     match head {
         ArrowHead::Filled => {
-            painter.add(Shape::convex_polygon(
-                vec![to, left, right],
-                c32(color),
-                Stroke::NONE,
-            ));
+            painter.line_segment([from, to], Stroke::new(width, col));
+            draw_arrow_head_triangle(painter, dir, to, width, len, col);
         }
-        ArrowHead::Open => {
-            let s = Stroke::new(width, c32(color));
-            painter.line_segment([to, left], s);
-            painter.line_segment([to, right], s);
+        ArrowHead::Dashed => {
+            draw_dashed_shaft(painter, from, to, width, col);
+            draw_arrow_head_triangle(painter, dir, to, width, len, col);
+        }
+        ArrowHead::Tapered => {
+            draw_tapered_arrow(painter, from, to, dir, width, col);
         }
     }
+}
+
+/// The filled triangle head shared by `Filled` and `Dashed` arrows. Mirrors
+/// `skrino_core::render`: head length ~3.5x thickness (min 10px), clamped to
+/// the arrow's own length so it never overshoots a very short arrow.
+fn draw_arrow_head_triangle(painter: &egui::Painter, dir: Vec2, to: Pos2, width: f32, arrow_len: f32, color: Color32) {
+    let head_len = (width * 3.5).max(10.0).min(arrow_len);
+    let perp = Vec2::new(-dir.y, dir.x);
+    let base = to - dir * head_len;
+    let left = base + perp * head_len * 0.5;
+    let right = base - perp * head_len * 0.5;
+    painter.add(Shape::convex_polygon(vec![to, left, right], color, Stroke::NONE));
+}
+
+/// Dashed shaft: dash ~3x thickness, gap ~2x thickness, starting at the tail.
+/// The filled head triangle is drawn separately (over the dashes near the
+/// tip), matching `Filled`'s shaft-then-head layering.
+fn draw_dashed_shaft(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: Color32) {
+    let vec = to - from;
+    let len = vec.length();
+    if len < 1e-3 {
+        return;
+    }
+    let dir = vec / len;
+    let dash = (width * 3.0).max(2.0);
+    let gap = (width * 2.0).max(2.0);
+    let stroke = Stroke::new(width, color);
+    let mut d = 0.0;
+    while d < len {
+        let seg_end = (d + dash).min(len);
+        painter.line_segment([from + dir * d, from + dir * seg_end], stroke);
+        d += dash + gap;
+    }
+}
+
+/// Tapered "Yandex-style" arrow. Mirrors `skrino_core::render`'s `draw_arrow`
+/// Tapered branch exactly: head length ~3.5x thickness (min 12px), clamped to
+/// <=60% of the arrow's length for short arrows via `k` — and the whole taper
+/// (tail/neck half-widths, not just the head) scales down by that same `k`,
+/// so a short arrow doesn't end up with a disproportionately fat neck.
+/// Drawn as a tapered quad (tail to neck) + a head triangle sharing the neck
+/// edge, which reads as one continuous filled shape (core fills a single
+/// 7-point path; two convex pieces avoid feeding a concave polygon to egui's
+/// fan-triangulating `Shape::convex_polygon`).
+fn draw_tapered_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, dir: Vec2, width: f32, color: Color32) {
+    let t = width;
+    let len = (to - from).length();
+    let perp = Vec2::new(-dir.y, dir.x);
+
+    let base_head_len = (t * 3.5).max(12.0);
+    let head_len = base_head_len.min(len * 0.6);
+    let k = (head_len / base_head_len).clamp(0.0, 1.0);
+    let tail_half_w = 0.25 * t * k;
+    let neck_half_w = 0.8 * t * k;
+    let head_half_w = 2.0 * t * k;
+
+    let neck = to - dir * head_len;
+    let tail_left = from + perp * tail_half_w;
+    let tail_right = from - perp * tail_half_w;
+    let neck_left = neck + perp * neck_half_w;
+    let neck_right = neck - perp * neck_half_w;
+    let head_left = neck + perp * head_half_w;
+    let head_right = neck - perp * head_half_w;
+
+    painter.add(Shape::convex_polygon(
+        vec![tail_left, neck_left, neck_right, tail_right],
+        color,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(vec![to, head_left, head_right], color, Stroke::NONE));
 }
 
 fn ellipse_points(r: egui::Rect, segments: usize) -> Vec<Pos2> {

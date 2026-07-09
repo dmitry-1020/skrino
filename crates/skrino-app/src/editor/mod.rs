@@ -163,25 +163,57 @@ impl EditorState {
         }
     }
 
-    /// Fit the image inside `canvas` and centre it.
-    fn fit(&mut self, canvas: egui::Rect) {
-        let iw = self.img_w as f32;
-        let ih = self.img_h as f32;
-        if iw <= 0.0 || ih <= 0.0 {
+    /// Fit `content` (image-pixel space; see [`Self::content_rect`] /
+    /// [`Self::display_rect`]) inside `canvas` and centre it. `content` can
+    /// have a negative min and/or be larger than the base image — annotations
+    /// drawn outside the screenshot expand it (Task 4), and an applied crop
+    /// shrinks it to a sub-rect (Task 3).
+    fn fit(&mut self, canvas: egui::Rect, content: skrino_core::Rect) {
+        let cw = content.width();
+        let ch = content.height();
+        if cw <= 0.0 || ch <= 0.0 {
             return;
         }
         let margin = 32.0;
         let avail_w = (canvas.width() - margin).max(16.0);
         let avail_h = (canvas.height() - margin).max(16.0);
-        let zoom = (avail_w / iw).min(avail_h / ih).clamp(0.05, 1.0);
+        let zoom = (avail_w / cw).min(avail_h / ch).clamp(0.05, 1.0);
         self.zoom = zoom;
-        self.center(canvas);
+        self.center(canvas, content);
     }
 
-    fn center(&mut self, canvas: egui::Rect) {
-        let img_center = Vec2::new(self.img_w as f32, self.img_h as f32) * 0.5 * self.zoom;
+    fn center(&mut self, canvas: egui::Rect, content: skrino_core::Rect) {
+        let cx = (content.min.x + content.max.x) * 0.5;
+        let cy = (content.min.y + content.max.y) * 0.5;
+        let content_center = Vec2::new(cx, cy) * self.zoom;
         let c = canvas.center();
-        self.offset = Vec2::new(c.x - img_center.x, c.y - img_center.y);
+        self.offset = Vec2::new(c.x - content_center.x, c.y - content_center.y);
+    }
+
+    /// The document's full drawable extent: the base image unioned with the
+    /// bounds of every annotation (see `skrino_core::render::canvas_rect`).
+    /// Annotations drawn outside the screenshot expand this — the canvas
+    /// backs them with white, matching what export produces (Task 4).
+    fn content_rect(&self) -> skrino_core::Rect {
+        skrino_core::render::canvas_rect(&self.doc)
+    }
+
+    /// The rect actually shown (and clipped to) in the canvas this frame.
+    ///
+    /// While the Crop tool is active, the full content is always shown so the
+    /// user can freely pick a new region (including one larger than, or
+    /// disjoint from, whatever crop is already applied). Otherwise, an
+    /// applied crop narrows the view to just that region — this is what makes
+    /// "Применить" in the crop tool actually crop the visible canvas rather
+    /// than just tag a rect that only affects export (see `crop_overlay` in
+    /// `canvas.rs`, which switches away from the Crop tool on Apply so the
+    /// narrowed view takes effect immediately).
+    fn display_rect(&self) -> skrino_core::Rect {
+        if self.tool != Tool::Crop
+            && let Some(crop) = self.doc.crop() {
+                return crop;
+            }
+        self.content_rect()
     }
 
     /// Main entry: draw the whole editor window and return a signal.

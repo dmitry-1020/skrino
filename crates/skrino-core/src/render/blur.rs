@@ -74,24 +74,16 @@ fn box_blur_h(src: &[[u16; 4]], dst: &mut [[u16; 4]], w: usize, h: usize, r: usi
         // Initialise the running sum for x = 0 (clamped left edge).
         let mut sum = [0u32; 4];
         for k in 0..=r {
-            let idx = k.min(w - 1);
-            accumulate(&mut sum, &src[row + idx]);
+            accumulate(&mut sum, &src[row + k.min(w - 1)]);
         }
-        // Left edge repeats src[0] for the r pixels before it.
-        for c in 0..4 {
-            sum[c] += (src[row].get_channel(c) as u32) * (r as u32);
-        }
+        // Left edge repeats src[row] for the r pixels before it.
+        add_scaled(&mut sum, &src[row], r as u32);
         for x in 0..w {
-            for c in 0..4 {
-                dst[row + x][c] = ((sum[c] + window / 2) / window) as u16;
-            }
+            write_avg(&mut dst[row + x], &sum, window);
             // Slide: add the pixel entering on the right, drop the one leaving.
-            let add_idx = (x + r + 1).min(w - 1);
-            let sub_idx = if x >= r { x - r } else { 0 };
-            for c in 0..4 {
-                sum[c] += src[row + add_idx].get_channel(c) as u32;
-                sum[c] -= src[row + sub_idx].get_channel(c) as u32;
-            }
+            let add = src[row + (x + r + 1).min(w - 1)];
+            let sub = src[row + x.saturating_sub(r)];
+            slide(&mut sum, &add, &sub);
         }
     }
 }
@@ -102,39 +94,46 @@ fn box_blur_v(src: &[[u16; 4]], dst: &mut [[u16; 4]], w: usize, h: usize, r: usi
     for x in 0..w {
         let mut sum = [0u32; 4];
         for k in 0..=r {
-            let idx = k.min(h - 1);
-            accumulate(&mut sum, &src[idx * w + x]);
+            accumulate(&mut sum, &src[k.min(h - 1) * w + x]);
         }
-        for c in 0..4 {
-            sum[c] += (src[x].get_channel(c) as u32) * (r as u32);
-        }
+        add_scaled(&mut sum, &src[x], r as u32);
         for y in 0..h {
-            for c in 0..4 {
-                dst[y * w + x][c] = ((sum[c] + window / 2) / window) as u16;
-            }
-            let add_idx = (y + r + 1).min(h - 1);
-            let sub_idx = if y >= r { y - r } else { 0 };
-            for c in 0..4 {
-                sum[c] += src[add_idx * w + x].get_channel(c) as u32;
-                sum[c] -= src[sub_idx * w + x].get_channel(c) as u32;
-            }
+            write_avg(&mut dst[y * w + x], &sum, window);
+            let add = src[(y + r + 1).min(h - 1) * w + x];
+            let sub = src[y.saturating_sub(r) * w + x];
+            slide(&mut sum, &add, &sub);
         }
     }
 }
 
 #[inline]
 fn accumulate(sum: &mut [u32; 4], px: &[u16; 4]) {
-    for c in 0..4 {
-        sum[c] += px[c] as u32;
+    for (s, &v) in sum.iter_mut().zip(px.iter()) {
+        *s += v as u32;
     }
 }
 
-trait Channel {
-    fn get_channel(&self, c: usize) -> u16;
+/// `sum += px * scale` (used to seed the clamped edge repeat).
+#[inline]
+fn add_scaled(sum: &mut [u32; 4], px: &[u16; 4], scale: u32) {
+    for (s, &v) in sum.iter_mut().zip(px.iter()) {
+        *s += v as u32 * scale;
+    }
 }
-impl Channel for [u16; 4] {
-    #[inline]
-    fn get_channel(&self, c: usize) -> u16 {
-        self[c]
+
+/// Write the box average of `sum` (window size `window`) into `dst`.
+#[inline]
+fn write_avg(dst: &mut [u16; 4], sum: &[u32; 4], window: u32) {
+    for (d, &s) in dst.iter_mut().zip(sum.iter()) {
+        *d = ((s + window / 2) / window) as u16;
+    }
+}
+
+/// Slide the running window: `sum += add - sub`.
+#[inline]
+fn slide(sum: &mut [u32; 4], add: &[u16; 4], sub: &[u16; 4]) {
+    for ((s, &a), &b) in sum.iter_mut().zip(add.iter()).zip(sub.iter()) {
+        *s += a as u32;
+        *s -= b as u32;
     }
 }

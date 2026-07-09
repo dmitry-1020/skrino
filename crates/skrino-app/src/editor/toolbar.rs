@@ -1,7 +1,7 @@
 //! Editor chrome: the tool toolbar, the contextual style row, and the bottom
 //! action bar.
 
-use egui::{Color32, CornerRadius, FontId, Pos2, RichText, Sense, Stroke, Vec2};
+use egui::{Color32, CornerRadius, FontId, Pos2, RichText, Sense, Shape, Stroke, Vec2};
 use egui_phosphor::regular as ph;
 use skrino_core::{ArrowHead, Tool};
 
@@ -159,43 +159,128 @@ pub fn context_row(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette
         }
 
         // Non-group layout (Выделение/Стрелка/Текст/Размытие/Обрезать):
-        // colours, then thickness, then the tool's own extra controls —
-        // unchanged from before the grouping.
+        // type (if the tool has one), then thickness/size, then colours —
+        // the same left-to-right order as the grouped tools below.
+        if state.tool == Tool::Arrow {
+            arrow_style_picker(state, ui, palette);
+            toolbar_separator(ui, palette);
+        }
+
+        if state.tool == Tool::Text {
+            ui.label(RichText::new("Размер").color(palette.text_secondary).size(12.0));
+            ui.add(egui::Slider::new(&mut state.text_size, 14.0..=48.0).show_value(false));
+            toolbar_separator(ui, palette);
+        } else if !matches!(state.tool, Tool::Select | Tool::Crop) {
+            ui.label(RichText::new("Толщина").color(palette.text_secondary).size(12.0));
+            ui.add(egui::Slider::new(&mut state.thickness, 2.0..=12.0).show_value(false));
+            toolbar_separator(ui, palette);
+        }
+
         for (name, color) in SWATCHES {
             if swatch(ui, palette, color, name, state.color == color).clicked() {
                 state.color = color;
             }
         }
-
-        toolbar_separator(ui, palette);
-
-        if !matches!(state.tool, Tool::Select | Tool::Text | Tool::Crop) {
-            ui.label(RichText::new("Толщина").color(palette.text_secondary).size(12.0));
-            ui.add(egui::Slider::new(&mut state.thickness, 2.0..=12.0).show_value(false));
-        }
-
-        // Text size.
-        if state.tool == Tool::Text {
-            ui.label(RichText::new("Размер").color(palette.text_secondary).size(12.0));
-            ui.add(egui::Slider::new(&mut state.text_size, 14.0..=48.0).show_value(false));
-        }
-
-        // Arrowhead toggle.
-        if state.tool == Tool::Arrow {
-            toolbar_separator(ui, palette);
-            let filled = state.arrow_head == ArrowHead::Filled;
-            if icon_button(ui, palette, ph::ARROW_UP_RIGHT, "Заполненный наконечник", filled, true)
-                .clicked()
-            {
-                state.arrow_head = ArrowHead::Filled;
-            }
-            if icon_button(ui, palette, ph::ARROW_LINE_UP_RIGHT, "Открытый наконечник", !filled, true)
-                .clicked()
-            {
-                state.arrow_head = ArrowHead::Open;
-            }
-        }
     });
+}
+
+/// Row of three arrow-style buttons (Task 2): each paints a small preview
+/// icon of its style via the egui painter rather than a font glyph, since no
+/// icon font ships a "tapered arrow" glyph. The selected style persists on
+/// `EditorState` across tool switches, same as the group subtypes.
+fn arrow_style_picker(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) {
+    const STYLES: [(ArrowHead, &str); 3] = [
+        (ArrowHead::Filled, "Сплошная"),
+        (ArrowHead::Dashed, "Пунктирная"),
+        (ArrowHead::Tapered, "Сужающаяся"),
+    ];
+    for (style, label) in STYLES {
+        if arrow_style_button(ui, palette, style, label, state.arrow_head == style).clicked() {
+            state.arrow_head = style;
+        }
+    }
+}
+
+fn arrow_style_button(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    style: ArrowHead,
+    tooltip: &str,
+    selected: bool,
+) -> egui::Response {
+    let size = Vec2::new(38.0, 34.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = resp.hovered();
+    let (bg, fg) = if selected {
+        (palette.accent, palette.accent_fg)
+    } else if hovered {
+        (palette.surface, palette.text)
+    } else {
+        (Color32::TRANSPARENT, palette.text)
+    };
+
+    let painter = ui.painter();
+    if bg != Color32::TRANSPARENT {
+        painter.rect_filled(rect.shrink(2.0), CornerRadius::same(8), bg);
+    }
+    let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::new(22.0, 14.0));
+    paint_arrow_style_icon(painter, icon_rect, style, fg);
+
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tooltip)
+}
+
+/// Hand-paint a mini arrow preview (~22x14) for the style picker: a solid
+/// shaft + filled head for `Filled`, the same head with a dashed shaft for
+/// `Dashed`, and a single tapered filled shape for `Tapered` — mirroring the
+/// full-size rendering in `tools.rs`.
+fn paint_arrow_style_icon(painter: &egui::Painter, rect: egui::Rect, style: ArrowHead, color: Color32) {
+    let y = rect.center().y;
+    let x0 = rect.left();
+    let x1 = rect.right();
+    let head_len = rect.width() * 0.45;
+    let head_half_w = rect.height() * 0.5;
+    let base_x = x1 - head_len;
+    let tip = Pos2::new(x1, y);
+    let head_left = Pos2::new(base_x, y - head_half_w);
+    let head_right = Pos2::new(base_x, y + head_half_w);
+
+    match style {
+        ArrowHead::Filled => {
+            painter.line_segment([Pos2::new(x0, y), Pos2::new(base_x, y)], Stroke::new(2.0, color));
+            painter.add(Shape::convex_polygon(vec![tip, head_left, head_right], color, Stroke::NONE));
+        }
+        ArrowHead::Dashed => {
+            let dash = 3.0;
+            let gap = 2.5;
+            let mut x = x0;
+            while x < base_x {
+                let xe = (x + dash).min(base_x);
+                painter.line_segment([Pos2::new(x, y), Pos2::new(xe, y)], Stroke::new(2.0, color));
+                x += dash + gap;
+            }
+            painter.add(Shape::convex_polygon(vec![tip, head_left, head_right], color, Stroke::NONE));
+        }
+        ArrowHead::Tapered => {
+            let tail_hw = rect.height() * 0.14;
+            let base_hw = rect.height() * 0.32;
+            // Tapered shaft (convex quad) + head triangle: two convex pieces
+            // sharing the base edge read as one continuous tapered shape.
+            painter.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(x0, y - tail_hw),
+                    Pos2::new(base_x, y - base_hw),
+                    Pos2::new(base_x, y + base_hw),
+                    Pos2::new(x0, y + tail_hw),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::convex_polygon(vec![tip, head_left, head_right], color, Stroke::NONE));
+        }
+    }
 }
 
 /// Row of icon-only subtype buttons for a group; the active subtype gets the
