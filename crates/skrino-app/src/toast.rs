@@ -24,6 +24,12 @@ pub enum ToastAction {
     OpenSettings,
     /// Reveal this file in the system file manager (Explorer /select).
     RevealFile(std::path::PathBuf),
+    /// Remember `dir` as the silent-save folder (sets `save_dir` and turns
+    /// `ask_where_to_save` off).
+    RememberSaveFolder(std::path::PathBuf),
+    /// Re-run this one save through the file dialog (already-encoded bytes,
+    /// so no re-render is needed).
+    ReSaveAs { bytes: Vec<u8>, filename: String },
 }
 
 /// A labelled, clickable action rendered inside a toast card.
@@ -113,6 +119,46 @@ impl Toasts {
             vec![ToastButton {
                 label: "Открыть папку",
                 action: ToastAction::RevealFile(path),
+            }],
+        );
+    }
+
+    /// A silent-save success toast: reveal the folder, or redo just this save
+    /// through the dialog.
+    pub fn saved_silent(
+        &mut self,
+        msg: impl Into<String>,
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+        filename: String,
+    ) {
+        self.push(
+            msg.into(),
+            ToastKind::Success,
+            8.0,
+            vec![
+                ToastButton {
+                    label: "Открыть папку",
+                    action: ToastAction::RevealFile(path),
+                },
+                ToastButton {
+                    label: "Изменить…",
+                    action: ToastAction::ReSaveAs { bytes, filename },
+                },
+            ],
+        );
+    }
+
+    /// A dialog-save success toast that offers to remember `dir` for future
+    /// silent saves.
+    pub fn saved_ask_remember(&mut self, msg: impl Into<String>, dir: std::path::PathBuf) {
+        self.push(
+            msg.into(),
+            ToastKind::Success,
+            8.0,
+            vec![ToastButton {
+                label: "Запомнить папку",
+                action: ToastAction::RememberSaveFolder(dir),
             }],
         );
     }

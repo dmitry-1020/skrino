@@ -38,6 +38,7 @@ webbrowser = "1"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+tauri-winrt-notification = "0.8.0"
 winapi = { version = "0.3", features = [
     "winuser",
     "windef",

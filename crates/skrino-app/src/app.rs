@@ -11,7 +11,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{
     Color32, CornerRadius, FontId, Pos2, RichText, Sense, Stroke, Vec2, ViewportCommand,
@@ -36,6 +36,9 @@ pub const START_SIZE: Vec2 = Vec2::new(420.0, 392.0);
 const EDITOR_SIZE: Vec2 = Vec2::new(1120.0, 780.0);
 /// Settings-window host size (fits the settings dialog).
 const SETTINGS_SIZE: Vec2 = Vec2::new(540.0, 620.0);
+/// Hard cap on how long a window-close waits for an in-flight share to finish
+/// before the process exits anyway (see [`SkrinoApp::handle_close_request`]).
+const SHARE_CLOSE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How the UI process was launched. Each mode is one-shot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,14 @@ pub struct SkrinoApp {
     share: Option<ShareHandle>,
     /// Last server-share payload, kept so "Повторить" can re-upload.
     pending_share: Option<(skrino_upload::UploadConfig, String, Vec<u8>)>,
+    /// Set once the window-close was deferred because a share was in flight
+    /// (see [`Self::handle_close_request`]). While `true` the window stays
+    /// hidden and the process waits for the share to finish (or time out)
+    /// before actually exiting.
+    pending_close: bool,
+    /// Hard deadline for a deferred close: the process exits at this instant
+    /// even if the upload never reports back.
+    close_deadline: Option<Instant>,
 }
 
 impl SkrinoApp {
@@ -108,6 +119,8 @@ impl SkrinoApp {
             settings: SettingsWindow::default(),
             share: None,
             pending_share: None,
+            pending_close: false,
+            close_deadline: None,
         }
     }
 
@@ -238,27 +251,23 @@ impl SkrinoApp {
             self.toasts.error(format!("Буфер обмена: {e}"));
         } else {
             self.toasts.success("Скопировано");
+            crate::notify::notify(
+                "Скриншот скопирован в буфер",
+                "",
+                self.config.notifications,
+            );
         }
     }
 
+    /// «Сохранить» (and Ctrl+S): either straight into the remembered folder
+    /// with no dialog, or through the rfd dialog — per `ask_where_to_save`.
     fn do_save(&mut self, ed: &EditorState) {
         let Some(img) = self.render(ed) else { return };
         let ext = self.config.format.extension();
-        let default_name = match catch_unwind(|| skrino_upload::generate_filename(ext)) {
+        let filename = match catch_unwind(|| skrino_upload::generate_filename(ext)) {
             Ok(name) => name,
             Err(_) => format!("skrino.{ext}"),
         };
-        let dir = self.config.default_save_dir();
-        let _ = std::fs::create_dir_all(&dir);
-
-        let path = rfd::FileDialog::new()
-            .set_title("Сохранить скриншот")
-            .set_directory(&dir)
-            .set_file_name(&default_name)
-            .add_filter("Изображение", &[ext])
-            .save_file();
-        let Some(path) = path else { return };
-
         let bytes = match encode_image(&img, self.config.format, self.config.jpeg_quality) {
             Ok(b) => b,
             Err(e) => {
@@ -266,13 +275,61 @@ impl SkrinoApp {
                 return;
             }
         };
-        match std::fs::write(&path, bytes) {
+        if self.config.ask_where_to_save {
+            self.save_bytes_via_dialog(bytes, filename);
+        } else {
+            let dir = self.config.default_save_dir();
+            self.save_bytes_silent(&dir, &filename, bytes);
+        }
+    }
+
+    /// Write `bytes` straight into `dir` with no dialog; toast offers to
+    /// reveal the folder or redo this one save through the dialog.
+    fn save_bytes_silent(&mut self, dir: &Path, filename: &str, bytes: Vec<u8>) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            self.toasts.error(format!("Не удалось создать папку: {e}"));
+            return;
+        }
+        let path = dir.join(filename);
+        match std::fs::write(&path, &bytes) {
             Ok(()) => {
+                crate::notify::notify("Сохранено", path.display().to_string(), self.config.notifications);
+                self.toasts.saved_silent(
+                    format!("Сохранено: {}", path.display()),
+                    path,
+                    bytes,
+                    filename.to_string(),
+                );
+            }
+            Err(e) => self.toasts.error(format!("Не удалось сохранить: {e}")),
+        }
+    }
+
+    /// Save `bytes` through the rfd dialog; on success, remember the folder as
+    /// the new default and offer to skip the dialog entirely from now on.
+    fn save_bytes_via_dialog(&mut self, bytes: Vec<u8>, filename: String) {
+        let ext = self.config.format.extension();
+        let dir = self.config.default_save_dir();
+        let _ = std::fs::create_dir_all(&dir);
+
+        let path = rfd::FileDialog::new()
+            .set_title("Сохранить скриншот")
+            .set_directory(&dir)
+            .set_file_name(&filename)
+            .add_filter("Изображение", &[ext])
+            .save_file();
+        let Some(path) = path else { return };
+
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => {
+                let msg = format!("Сохранено: {}", path.display());
                 if let Some(parent) = path.parent() {
-                    self.config.last_save_dir = Some(parent.to_path_buf());
+                    self.config.save_dir = Some(parent.to_path_buf());
                     self.config.save();
+                    self.toasts.saved_ask_remember(msg, parent.to_path_buf());
+                } else {
+                    self.toasts.success(msg);
                 }
-                self.toasts.success("Сохранено");
             }
             Err(e) => self.toasts.error(format!("Не удалось сохранить: {e}")),
         }
@@ -311,6 +368,11 @@ impl SkrinoApp {
         }
         // Copy the rendered image (not a link) to the clipboard.
         let _ = copy_image_to_clipboard(&img);
+        crate::notify::notify(
+            "Скриншот сохранён",
+            path.display().to_string(),
+            self.config.notifications,
+        );
         self.toasts
             .saved(format!("Сохранено: {}", path.display()), path);
     }
@@ -371,15 +433,31 @@ impl SkrinoApp {
             match res {
                 ShareResult::Success(url) => {
                     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(url.clone())) {
-                        Ok(()) => self.toasts.link(format!("Ссылка скопирована: {url}"), url),
-                        Err(_) => self.toasts.link(format!("Готово: {url}"), url),
+                        Ok(()) => self.toasts.link(format!("Ссылка скопирована: {url}"), url.clone()),
+                        Err(_) => self.toasts.link(format!("Готово: {url}"), url.clone()),
                     }
+                    crate::notify::notify(
+                        "Ссылка скопирована в буфер",
+                        url,
+                        self.config.notifications,
+                    );
                 }
                 ShareResult::Failure { error, auth, saved_to } => {
                     let extra = saved_to
                         .map(|p| format!(" • сохранено локально: {}", p.display()))
                         .unwrap_or_default();
                     let msg = format!("Не удалось отправить: {error}{extra}");
+                    // A visible window shows the retry toast; but if we're
+                    // exiting because the window was closed mid-upload, that
+                    // toast will never be seen — fall back to a system
+                    // notification so the user still learns the outcome.
+                    if self.pending_close {
+                        crate::notify::notify(
+                            "Не удалось отправить скриншот",
+                            msg.clone(),
+                            self.config.notifications,
+                        );
+                    }
                     if auth {
                         // Bad credentials: offer a jump to settings alongside retry.
                         self.toasts.error_retry_auth(msg);
@@ -478,7 +556,18 @@ impl SkrinoApp {
                 let sharing = self.share.as_ref().is_some_and(|h| h.in_flight());
                 let signal = ed.ui(ctx, palette, sharing);
                 match signal {
-                    EditorSignal::Close => next = Some(self.finish()),
+                    EditorSignal::Close => {
+                        // Escape closes the editor the same way the OS window
+                        // X does; a one-shot process would otherwise exit
+                        // immediately here and kill an in-flight upload on
+                        // its worker thread. Defer exactly like
+                        // `handle_close_request` does for that case.
+                        if !self.is_interactive() && sharing {
+                            self.defer_close_for_share(ctx);
+                        } else {
+                            next = Some(self.finish());
+                        }
+                    }
                     EditorSignal::Copy => self.do_copy(ed),
                     EditorSignal::Save => self.do_save(ed),
                     EditorSignal::Share => self.do_share(ed),
@@ -497,14 +586,49 @@ impl SkrinoApp {
         self.state = next.unwrap_or(state);
     }
 
+    /// Hide the window and mark the process as waiting out an in-flight share
+    /// instead of exiting immediately (see [`Self::handle_close_request`]).
+    fn defer_close_for_share(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.pending_close = true;
+        self.close_deadline = Some(Instant::now() + SHARE_CLOSE_TIMEOUT);
+    }
+
+    /// Closing the window normally ends the process (no tray in the UI
+    /// process). But if a share upload is still in flight, exiting now would
+    /// silently kill it on its worker thread — instead we cancel the OS
+    /// close, hide the window, and keep the process alive just long enough
+    /// for the `ShareResult` to arrive (bounded by [`SHARE_CLOSE_TIMEOUT`])
+    /// before actually exiting.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) {
-            // Closing the window ends the process (no tray in the UI process).
+        if !self.pending_close && ctx.input(|i| i.viewport().close_requested()) {
+            if self.share.as_ref().is_some_and(|h| h.in_flight()) {
+                self.defer_close_for_share(ctx);
+                return;
+            }
             if self.is_interactive() {
                 // First-run / Start window: settle into the tray on the way out.
                 self.settle_into_background();
             } else {
                 self.config.save();
+            }
+        }
+
+        if self.pending_close {
+            let still_sharing = self.share.as_ref().is_some_and(|h| h.in_flight());
+            let timed_out = self.close_deadline.is_some_and(|d| Instant::now() >= d);
+            if timed_out && still_sharing {
+                crate::notify::notify(
+                    "Не удалось отправить скриншот",
+                    "истекло время ожидания ответа сервера",
+                    self.config.notifications,
+                );
+            }
+            if !still_sharing || timed_out {
+                self.quit();
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(200));
             }
         }
     }
@@ -557,6 +681,16 @@ impl eframe::App for SkrinoApp {
                 if let Ok(exe) = std::env::current_exe() {
                     let _ = std::process::Command::new(exe).arg("--settings").spawn();
                 }
+            }
+            ToastAction::RememberSaveFolder(dir) => {
+                self.config.save_dir = Some(dir);
+                self.config.ask_where_to_save = false;
+                self.config.save();
+                self.toasts
+                    .info("Теперь сохраняю сюда без вопросов. Изменить можно в настройках.");
+            }
+            ToastAction::ReSaveAs { bytes, filename } => {
+                self.save_bytes_via_dialog(bytes, filename);
             }
             ToastAction::None => {}
         }

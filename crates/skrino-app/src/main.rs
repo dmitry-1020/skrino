@@ -15,6 +15,7 @@ mod config;
 mod daemon;
 mod editor;
 mod hotkey;
+mod notify;
 mod overlay;
 mod settings_ui;
 mod share;
@@ -39,17 +40,11 @@ fn main() {
     let mode = parse_mode();
     let config = AppConfig::load();
 
-    // No-arg launch is context-sensitive:
-    //   * first run (configured == false) → show the Start window (below);
-    //   * after setup (configured == true) → this is just a "make sure it's
-    //     running" double-click: spawn the tray daemon (the single-instance
-    //     mutex dedupes) and exit without any window.
-    // `--start` is the escape hatch that always forces the Start window.
-    let forced_start = std::env::args().any(|a| a == "--start");
-    if matches!(mode, LaunchMode::Start) && config.configured && !forced_start {
-        spawn_tray();
-        return;
-    }
+    // No-arg launch always opens the Start window — `--start` is just an
+    // explicit synonym for the same thing (see `parse_mode`). Closing the
+    // Start window is what settles Skrino into the tray (see
+    // `SkrinoApp::settle_into_background`); the double-click itself never
+    // silently spawns the daemon and exits.
 
     // Start-window is shown immediately; one-shot modes stay hidden until the app
     // reshapes the root window on its first frame (capture happens first).
@@ -81,14 +76,6 @@ fn main() {
     ) {
         log::error!("failed to start: {e}");
         std::process::exit(1);
-    }
-}
-
-/// Spawn the background tray daemon and detach. The daemon's single-instance
-/// mutex makes a redundant spawn silent and harmless.
-fn spawn_tray() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).arg("--tray").spawn();
     }
 }
 

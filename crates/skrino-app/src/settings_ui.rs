@@ -85,6 +85,8 @@ impl SettingsWindow {
                 egui::ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
                     self.share_section(ui, &mut work, palette);
                     ui.add_space(10.0);
+                    self.save_section(ui, &mut work, palette);
+                    ui.add_space(10.0);
                     self.general_section(ui, &mut work, palette);
                 });
 
@@ -222,6 +224,33 @@ impl SettingsWindow {
             ui.add_space(8.0);
             self.upload_section(ui, cfg, palette);
         }
+    }
+
+    /// «Сохранение»: the folder «Сохранить» writes into, and whether it asks
+    /// every time or just saves straight into that folder.
+    fn save_section(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, palette: &Palette) {
+        section_header(ui, palette, "Сохранение");
+
+        let dir = cfg.default_save_dir();
+        ui.horizontal(|ui| {
+            if ui.button("Выбрать папку…").clicked()
+                && let Some(picked) = rfd::FileDialog::new()
+                    .set_title("Папка для сохранения скриншотов")
+                    .set_directory(&dir)
+                    .pick_folder()
+            {
+                cfg.save_dir = Some(picked);
+            }
+            ui.label(
+                RichText::new(dir.display().to_string())
+                    .size(12.0)
+                    .color(palette.text_secondary),
+            );
+        });
+        ui.checkbox(
+            &mut cfg.ask_where_to_save,
+            "Спрашивать место при каждом сохранении",
+        );
     }
 
     fn upload_section(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, palette: &Palette) {
@@ -388,6 +417,7 @@ impl SettingsWindow {
             });
 
         ui.checkbox(&mut cfg.autostart, "Запускать в фоне при старте системы");
+        ui.checkbox(&mut cfg.notifications, "Показывать уведомления");
     }
 
     /// Kick off a background connection test against the *unsaved* form values,

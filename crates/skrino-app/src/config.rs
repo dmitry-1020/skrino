@@ -167,14 +167,32 @@ pub struct AppConfig {
     pub jpeg_quality: u8,
     /// Launch in the background on system start (Windows Run key).
     pub autostart: bool,
-    /// Last directory used in the Save dialog (remembered between sessions).
-    pub last_save_dir: Option<PathBuf>,
+    /// Remembered save folder: the default directory offered in the Save
+    /// dialog, and (when `ask_where_to_save` is false) the silent-save target.
+    /// Was named `last_save_dir` before the folder became reusable for silent
+    /// saves; the alias keeps old configs loading unchanged.
+    #[serde(alias = "last_save_dir")]
+    pub save_dir: Option<PathBuf>,
+    /// Whether «Сохранить» asks where to save every time (rfd dialog) or
+    /// saves straight into `save_dir` with a generated filename.
+    #[serde(default = "default_true")]
+    pub ask_where_to_save: bool,
     pub upload: UploadSettings,
     /// Destination for the editor's «Поделиться» action.
     #[serde(default)]
     pub share_dest: ShareDestination,
     /// Set once the user has completed first-run setup.
     pub configured: bool,
+    /// Show native OS toast notifications for background events (share/save
+    /// results). In-app toasts are unaffected by this flag.
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+}
+
+/// `#[serde(default = "...")]` needs a named function; used for fields that
+/// default to `true` (old configs lacking the key get the new default).
+fn default_true() -> bool {
+    true
 }
 
 /// Default full-screen hotkey (also used by `#[serde(default)]` for old configs).
@@ -191,10 +209,12 @@ impl Default for AppConfig {
             format: ImageFormat::Png,
             jpeg_quality: 90,
             autostart: false,
-            last_save_dir: None,
+            save_dir: None,
+            ask_where_to_save: true,
             upload: UploadSettings::default(),
             share_dest: ShareDestination::default(),
             configured: false,
+            notifications: true,
         }
     }
 }
@@ -213,11 +233,10 @@ impl AppConfig {
             .join("Skrino")
     }
 
-    /// Default directory offered in the Save dialog.
+    /// Default directory offered in the Save dialog (and, when
+    /// `ask_where_to_save` is false, the silent-save target).
     pub fn default_save_dir(&self) -> PathBuf {
-        self.last_save_dir
-            .clone()
-            .unwrap_or_else(Self::fallback_dir)
+        self.save_dir.clone().unwrap_or_else(Self::fallback_dir)
     }
 
     /// Load config, falling back to defaults on any error (missing file,
@@ -330,7 +349,9 @@ mod tests {
         cfg.format = ImageFormat::Jpeg;
         cfg.jpeg_quality = 75;
         cfg.autostart = true;
-        cfg.last_save_dir = Some(PathBuf::from("C:/shots"));
+        cfg.save_dir = Some(PathBuf::from("C:/shots"));
+        cfg.ask_where_to_save = false;
+        cfg.notifications = false;
         cfg.upload.host = "example.com".into();
         cfg.upload.protocol = Protocol::Ftps;
         cfg.upload.url_template = "https://example.com/s/{filename}".into();
@@ -390,6 +411,55 @@ mod tests {
         let back: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(back.hotkey, "PrintScreen");
         assert_eq!(back.hotkey_full, "Ctrl+Shift+4");
+    }
+
+    #[test]
+    fn old_config_with_legacy_last_save_dir_key_aliases_to_save_dir() {
+        // A config.json written before `save_dir` was renamed from
+        // `last_save_dir` must still populate the (renamed) field via alias.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "last_save_dir": "C:/old/shots",
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(back.save_dir, Some(PathBuf::from("C:/old/shots")));
+    }
+
+    #[test]
+    fn old_config_without_ask_where_to_save_defaults_to_true() {
+        // Earlier configs have no `ask_where_to_save` key; must default to
+        // asking every time (unchanged prior behaviour) rather than silently
+        // saving somewhere the user never picked.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(back.ask_where_to_save);
+    }
+
+    #[test]
+    fn old_config_without_notifications_defaults_to_true() {
+        // Earlier configs have no `notifications` key; must default to shown.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(back.notifications);
     }
 
     #[test]
