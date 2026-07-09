@@ -74,6 +74,16 @@ enum AppState {
     SettingsOnly,
 }
 
+/// What `do_share` actually did — drives whether the editor closes.
+enum ShareOutcome {
+    /// Saved to the local folder, image in the clipboard: job done.
+    LocalDone,
+    /// Server upload spawned; close the editor once the link arrives.
+    ServerInFlight,
+    /// Nothing happened (validation/encode error, toast already shown).
+    Failed,
+}
+
 /// Desired OS window configuration for the current state. Applied only when it
 /// changes from the previously applied mode.
 #[derive(Clone, PartialEq)]
@@ -96,6 +106,9 @@ pub struct SkrinoApp {
     share: Option<ShareHandle>,
     /// Last server-share payload, kept so "Повторить" can re-upload.
     pending_share: Option<(skrino_upload::UploadConfig, String, Vec<u8>)>,
+    /// «Поделиться» was clicked in the editor: close it as soon as the link
+    /// lands in the clipboard (failure keeps it open so «Повторить» works).
+    close_after_share: bool,
     /// Set once the window-close was deferred because a share was in flight
     /// (see [`Self::handle_close_request`]). While `true` the window stays
     /// hidden and the process waits for the share to finish (or time out)
@@ -125,6 +138,7 @@ impl SkrinoApp {
             settings: SettingsWindow::default(),
             share: None,
             pending_share: None,
+            close_after_share: false,
             pending_close: false,
             close_deadline: None,
             hero_texture,
@@ -138,6 +152,8 @@ impl SkrinoApp {
     /// Save config and terminate the process. Used when a one-shot job finishes.
     fn quit(&self) -> ! {
         self.config.save();
+        // Don't lose a toast fired microseconds ago (copy/share auto-close).
+        crate::notify::flush();
         std::process::exit(0);
     }
 
@@ -246,10 +262,15 @@ impl SkrinoApp {
         }
     }
 
-    fn do_copy(&mut self, ed: &EditorState) {
-        let Some(img) = self.render(ed) else { return };
+    /// Returns `true` on success so the caller can close the editor: once the
+    /// image is in the clipboard the job is done.
+    fn do_copy(&mut self, ed: &EditorState) -> bool {
+        let Some(img) = self.render(ed) else {
+            return false;
+        };
         if let Err(e) = copy_image_to_clipboard(&img) {
             self.toasts.error(format!("Буфер обмена: {e}"));
+            false
         } else {
             self.toasts.success("Скопировано");
             crate::notify::notify(
@@ -257,6 +278,7 @@ impl SkrinoApp {
                 "",
                 self.config.notifications,
             );
+            true
         }
     }
 
@@ -337,15 +359,31 @@ impl SkrinoApp {
     }
 
     /// «Поделиться»: local folder or server, per the configured destination.
-    fn do_share(&mut self, ed: &EditorState) {
+    fn do_share(&mut self, ed: &EditorState) -> ShareOutcome {
         match self.config.share_dest.clone() {
-            ShareDestination::LocalDir { path } => self.share_local(ed, &path),
-            ShareDestination::Server => self.share_server(ed),
+            ShareDestination::LocalDir { path } => {
+                if self.share_local(ed, &path) {
+                    ShareOutcome::LocalDone
+                } else {
+                    ShareOutcome::Failed
+                }
+            }
+            ShareDestination::Server => {
+                if self.share_server(ed) {
+                    ShareOutcome::ServerInFlight
+                } else {
+                    ShareOutcome::Failed
+                }
+            }
         }
     }
 
-    fn share_local(&mut self, ed: &EditorState, dir: &Path) {
-        let Some(img) = self.render(ed) else { return };
+    /// Returns `true` when the file landed in the folder (and the image is in
+    /// the clipboard) — the caller then closes the editor.
+    fn share_local(&mut self, ed: &EditorState, dir: &Path) -> bool {
+        let Some(img) = self.render(ed) else {
+            return false;
+        };
         let ext = self.config.format.extension();
         let filename = match catch_unwind(|| skrino_upload::generate_filename(ext)) {
             Ok(name) => name,
@@ -355,17 +393,17 @@ impl SkrinoApp {
             Ok(b) => b,
             Err(e) => {
                 self.toasts.error(format!("Кодирование: {e}"));
-                return;
+                return false;
             }
         };
         if let Err(e) = std::fs::create_dir_all(dir) {
             self.toasts.error(format!("Не удалось создать папку: {e}"));
-            return;
+            return false;
         }
         let path = dir.join(&filename);
         if let Err(e) = std::fs::write(&path, &bytes) {
             self.toasts.error(format!("Не удалось сохранить: {e}"));
-            return;
+            return false;
         }
         // Copy the rendered image (not a link) to the clipboard.
         let _ = copy_image_to_clipboard(&img);
@@ -376,18 +414,23 @@ impl SkrinoApp {
         );
         self.toasts
             .saved(format!("Сохранено: {}", path.display()), path);
+        true
     }
 
-    fn share_server(&mut self, ed: &EditorState) {
+    /// Returns `true` when the upload was actually spawned — the caller then
+    /// hides the window and lets the deferred-close flow finish the job.
+    fn share_server(&mut self, ed: &EditorState) -> bool {
         if self.share.as_ref().is_some_and(|h| h.in_flight()) {
-            return;
+            return false;
         }
         let Some(config) = self.config.upload.to_upload_config() else {
             self.toasts
                 .error("Настройте загрузку в параметрах, чтобы делиться ссылкой");
-            return;
+            return false;
         };
-        let Some(img) = self.render(ed) else { return };
+        let Some(img) = self.render(ed) else {
+            return false;
+        };
         let filename = match catch_unwind(|| skrino_upload::generate_filename("png")) {
             Ok(name) => name,
             Err(_) => "skrino.png".to_string(),
@@ -396,7 +439,7 @@ impl SkrinoApp {
             Ok(b) => b,
             Err(e) => {
                 self.toasts.error(format!("Кодирование: {e}"));
-                return;
+                return false;
             }
         };
         self.pending_share = Some((config.clone(), filename.clone(), bytes.clone()));
@@ -407,6 +450,7 @@ impl SkrinoApp {
             AppConfig::fallback_dir(),
         ));
         self.toasts.info("Отправка…");
+        true
     }
 
     fn retry_share(&mut self) {
@@ -442,8 +486,21 @@ impl SkrinoApp {
                         url,
                         self.config.notifications,
                     );
+                    // Link delivered: the editor's job is done, close it
+                    // (unless the window was already closed by the user,
+                    // then the pending_close path exits on its own).
+                    if self.close_after_share && !self.pending_close {
+                        self.close_after_share = false;
+                        if self.is_interactive() {
+                            self.state = AppState::Start;
+                        } else {
+                            self.quit();
+                        }
+                    }
                 }
                 ShareResult::Failure { error, auth, saved_to } => {
+                    // Failure keeps the editor open so «Повторить» works.
+                    self.close_after_share = false;
                     let extra = saved_to
                         .map(|p| format!(" • сохранено локально: {}", p.display()))
                         .unwrap_or_default();
@@ -587,9 +644,19 @@ impl SkrinoApp {
                             next = Some(self.finish());
                         }
                     }
-                    EditorSignal::Copy => self.do_copy(ed),
+                    EditorSignal::Copy => {
+                        // The image is in the clipboard: the job is done,
+                        // close the editor (per user request).
+                        if self.do_copy(ed) {
+                            next = Some(self.finish());
+                        }
+                    }
                     EditorSignal::Save => self.do_save(ed),
-                    EditorSignal::Share => self.do_share(ed),
+                    EditorSignal::Share => match self.do_share(ed) {
+                        ShareOutcome::LocalDone => next = Some(self.finish()),
+                        ShareOutcome::ServerInFlight => self.close_after_share = true,
+                        ShareOutcome::Failed => {}
+                    },
                     EditorSignal::None => {}
                 }
             }

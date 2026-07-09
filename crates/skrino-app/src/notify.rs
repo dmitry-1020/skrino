@@ -6,6 +6,14 @@
 //! never blocks the calling (typically UI) thread — the actual WinRT call
 //! happens on a short-lived detached thread.
 
+use std::sync::Mutex;
+use std::thread::JoinHandle;
+
+/// Detached notification threads that haven't been waited on yet. `flush`
+/// joins them before process exit so a just-fired toast isn't lost when the
+/// process quits immediately after an action (copy/share auto-close).
+static PENDING: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
 /// Fire a system notification with `title`/`body` when `enabled`. Any failure
 /// (no notifier registered, WinRT error, …) is logged and swallowed.
 pub fn notify(title: impl Into<String>, body: impl Into<String>, enabled: bool) {
@@ -21,8 +29,28 @@ pub fn notify(title: impl Into<String>, body: impl Into<String>, enabled: bool) 
                 log::warn!("system notification failed: {e}");
             }
         });
-    if let Err(e) = spawned {
-        log::warn!("could not spawn notification thread: {e}");
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut pending) = PENDING.lock() {
+                // Drop already-finished handles so the list never grows.
+                pending.retain(|h| !h.is_finished());
+                pending.push(handle);
+            }
+        }
+        Err(e) => log::warn!("could not spawn notification thread: {e}"),
+    }
+}
+
+/// Wait for in-flight notifications to be handed to the OS. Call right before
+/// `process::exit` — the WinRT `show` call is fast, so this returns almost
+/// immediately in practice; it only prevents killing the thread mid-call.
+pub fn flush() {
+    let handles: Vec<JoinHandle<()>> = match PENDING.lock() {
+        Ok(mut pending) => pending.drain(..).collect(),
+        Err(_) => return,
+    };
+    for h in handles {
+        let _ = h.join();
     }
 }
 

@@ -312,12 +312,15 @@ fn draw_badge(painter: &egui::Painter, pos: Pos2, text: &str, palette: &Palette)
     painter.galley(pos + pad, galley, palette.accent_fg);
 }
 
-fn draw_hint(painter: &egui::Painter, center: Pos2, text: &str, palette: &Palette) {
+fn draw_hint(painter: &egui::Painter, center: Pos2, text: &str, _palette: &Palette) {
+    // The pill sits on top of an arbitrary screenshot, so its colors are
+    // theme-independent: always white text on a dark translucent backdrop
+    // (palette.text is near-black in the light theme and would be unreadable).
     let font = FontId::proportional(13.0);
-    let galley = painter.layout_no_wrap(text.to_string(), font, palette.text);
+    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
     let pad = Vec2::new(12.0, 6.0);
     let size = galley.size() + pad * 2.0;
     let rect = Rect::from_center_size(center + Vec2::new(0.0, size.y * 0.5), size);
-    painter.rect_filled(rect, CornerRadius::same(8), Color32::from_black_alpha(160));
-    painter.galley(rect.min + pad, galley, palette.text);
+    painter.rect_filled(rect, CornerRadius::same(8), Color32::from_black_alpha(170));
+    painter.galley(rect.min + pad, galley, Color32::WHITE);
 }
