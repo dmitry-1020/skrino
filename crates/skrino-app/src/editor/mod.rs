@@ -46,6 +46,26 @@ struct TextEditor {
     color: Color,
 }
 
+/// Last-used subtype per toolbar group (Фигуры / Маркер), so re-entering a
+/// group (via its pill, or a keyboard shortcut in future) restores whichever
+/// subtype was active last, and the group pill can show that subtype's icon.
+/// Lives in UI state only — `skrino_core::Tool` itself is unaware of grouping.
+struct ToolboxState {
+    /// One of Rect / Ellipse / Line / Counter.
+    last_shape: Tool,
+    /// One of Marker / Pen.
+    last_marker: Tool,
+}
+
+impl Default for ToolboxState {
+    fn default() -> Self {
+        Self {
+            last_shape: Tool::Rect,
+            last_marker: Tool::Marker,
+        }
+    }
+}
+
 pub struct EditorState {
     pub doc: Document,
     img_w: u32,
@@ -58,6 +78,8 @@ pub struct EditorState {
     thickness: f32,
     text_size: f32,
     arrow_head: ArrowHead,
+    /// Last-used subtype per toolbar group (see [`ToolboxState`]).
+    toolbox: ToolboxState,
 
     // View transform.
     zoom: f32,
@@ -106,6 +128,7 @@ impl EditorState {
             thickness: 4.0,
             text_size: 24.0,
             arrow_head: ArrowHead::Filled,
+            toolbox: ToolboxState::default(),
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit_pending: true,
@@ -269,8 +292,25 @@ impl EditorState {
         }
     }
 
+    /// Last-used subtype of the "Фигуры" group (Rect/Ellipse/Line/Counter).
+    fn toolbox_last_shape(&self) -> Tool {
+        self.toolbox.last_shape
+    }
+
+    /// Last-used subtype of the "Маркер" group (Marker/Pen).
+    fn toolbox_last_marker(&self) -> Tool {
+        self.toolbox.last_marker
+    }
+
     /// Switch the active tool, finalising any in-progress interaction first.
     fn set_tool(&mut self, tool: Tool) {
+        // Remember the subtype even if it's already the active tool, so
+        // picking a group pill's default always matches the last selection.
+        match tool {
+            Tool::Rect | Tool::Ellipse | Tool::Line | Tool::Counter => self.toolbox.last_shape = tool,
+            Tool::Marker | Tool::Pen => self.toolbox.last_marker = tool,
+            _ => {}
+        }
         if self.tool == tool {
             return;
         }

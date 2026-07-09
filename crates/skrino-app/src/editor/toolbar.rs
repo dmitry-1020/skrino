@@ -13,37 +13,93 @@ use crate::theme::{Palette, SWATCHES};
 /// than egui's default compact size.
 const ACTION_BUTTON_HEIGHT: f32 = 36.0;
 
+/// Subtypes of the "Фигуры" group, in contextual-row / cycling order.
+/// (core tool, icon, label used both as the subtype tooltip and, for
+/// `Tool::Counter`, the user-facing name — the core enum variant stays
+/// `Counter`, only the UI-facing word changed to "Метка").
+const SHAPE_SUBTYPES: [(Tool, &str, &str); 4] = [
+    (Tool::Rect, ph::SQUARE, "Прямоугольник"),
+    (Tool::Ellipse, ph::CIRCLE, "Эллипс"),
+    (Tool::Line, ph::LINE_SEGMENT, "Линия"),
+    (Tool::Counter, ph::NUMBER_CIRCLE_ONE, "Метка"),
+];
+
+/// Subtypes of the "Маркер" group.
+const MARKER_SUBTYPES: [(Tool, &str, &str); 2] = [
+    (Tool::Marker, ph::HIGHLIGHTER, "Маркер"),
+    (Tool::Pen, ph::PENCIL_SIMPLE, "Карандаш"),
+];
+
+fn is_shape_tool(tool: Tool) -> bool {
+    SHAPE_SUBTYPES.iter().any(|(t, _, _)| *t == tool)
+}
+
+fn is_marker_tool(tool: Tool) -> bool {
+    MARKER_SUBTYPES.iter().any(|(t, _, _)| *t == tool)
+}
+
+/// Icon for the currently-selected subtype of a group (falls back to the
+/// group's first subtype if the given tool somehow isn't a member).
+fn subtype_icon(subtypes: &[(Tool, &'static str, &'static str)], current: Tool) -> &'static str {
+    subtypes
+        .iter()
+        .find(|(t, _, _)| *t == current)
+        .or_else(|| subtypes.first())
+        .map(|(_, icon, _)| *icon)
+        .unwrap_or("")
+}
+
 /// Top row: the drawing tools plus undo/redo.
 ///
 /// The main/frequent tools get an icon + text label pill (Yandex-Screenshots
-/// style); the rarer ones stay compact icon-only squares with a tooltip, so
-/// the whole row still fits the default ~1120px editor width.
+/// style); "Выделение" stays a compact icon-only square. "Фигуры" and
+/// "Маркер" are *groups*: the pill activates the group's last-used subtype,
+/// and the contextual row below (see [`context_row`]) offers the subtype
+/// picker while a group is active. This keeps the row short enough to fit the
+/// default ~1120px editor width even though it now covers all 11 core tools.
 pub fn top_toolbar(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) {
     ui.add_space(2.0);
     ui.horizontal_centered(|ui| {
         ui.add_space(4.0);
-        // (tool, icon, label/tooltip, is a "main" tool → labeled pill)
-        let tools: [(Tool, &str, &str, bool); 11] = [
-            (Tool::Select, ph::CURSOR, "Выделение", false),
-            (Tool::Arrow, ph::ARROW_UP_RIGHT, "Стрелка", true),
-            (Tool::Line, ph::LINE_SEGMENT, "Линия", false),
-            (Tool::Rect, ph::SQUARE, "Прямоугольник", true),
-            (Tool::Ellipse, ph::CIRCLE, "Эллипс", false),
-            (Tool::Text, ph::TEXT_T, "Текст", true),
-            (Tool::Marker, ph::HIGHLIGHTER, "Маркер", true),
-            (Tool::Pen, ph::PENCIL_SIMPLE, "Карандаш", false),
-            (Tool::Blur, ph::DROP, "Размытие", true),
-            (Tool::Counter, ph::NUMBER_CIRCLE_ONE, "Счётчик", false),
-            (Tool::Crop, ph::CROP, "Обрезать", true),
+
+        if icon_button(ui, palette, ph::CURSOR, "Выделение", state.tool == Tool::Select, true)
+            .clicked()
+        {
+            state.set_tool(Tool::Select);
+        }
+
+        // (tool, icon, label) — single-tool pills.
+        let singles: [(Tool, &str, &str); 2] = [
+            (Tool::Arrow, ph::ARROW_UP_RIGHT, "Стрелка"),
+            (Tool::Text, ph::TEXT_T, "Текст"),
         ];
-        for (tool, icon, label, main) in tools {
-            let selected = state.tool == tool;
-            let clicked = if main {
-                labeled_tool_button(ui, palette, icon, label, selected).clicked()
-            } else {
-                icon_button(ui, palette, icon, label, selected, true).clicked()
-            };
-            if clicked {
+        for (tool, icon, label) in singles {
+            if labeled_tool_button(ui, palette, icon, label, state.tool == tool).clicked() {
+                state.set_tool(tool);
+            }
+        }
+
+        // "Фигуры" group pill: activates the last-used subtype (default
+        // Прямоугольник); the pill's own icon tracks that subtype.
+        let shape_active = is_shape_tool(state.tool);
+        let shape_icon = subtype_icon(&SHAPE_SUBTYPES, state.toolbox_last_shape());
+        if labeled_tool_button(ui, palette, shape_icon, "Фигуры", shape_active).clicked() {
+            state.set_tool(state.toolbox_last_shape());
+        }
+
+        // "Маркер" group pill: same pattern.
+        let marker_active = is_marker_tool(state.tool);
+        let marker_icon = subtype_icon(&MARKER_SUBTYPES, state.toolbox_last_marker());
+        if labeled_tool_button(ui, palette, marker_icon, "Маркер", marker_active).clicked() {
+            state.set_tool(state.toolbox_last_marker());
+        }
+
+        let trailing: [(Tool, &str, &str); 2] = [
+            (Tool::Blur, ph::DROP, "Размытие"),
+            (Tool::Crop, ph::CROP, "Обрезать"),
+        ];
+        for (tool, icon, label) in trailing {
+            if labeled_tool_button(ui, palette, icon, label, state.tool == tool).clicked() {
                 state.set_tool(tool);
             }
         }
@@ -68,10 +124,43 @@ pub fn top_toolbar(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette
 }
 
 /// Second row: colour swatches, thickness, and tool-specific controls.
+///
+/// While a group (Фигуры / Маркер) is active, this row leads with that
+/// group's subtype picker — selecting a subtype switches the actual core
+/// `Tool`, so the canvas drawing/gesture logic in `canvas.rs` needs no
+/// changes at all.
 pub fn context_row(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette) {
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
-        // Colour swatches.
+
+        let group_subtypes = if is_shape_tool(state.tool) {
+            Some(&SHAPE_SUBTYPES[..])
+        } else if is_marker_tool(state.tool) {
+            Some(&MARKER_SUBTYPES[..])
+        } else {
+            None
+        };
+
+        if let Some(subtypes) = group_subtypes {
+            // Group layout: subtype pickers, then thickness, then colours.
+            subtype_picker(state, ui, palette, subtypes);
+            toolbar_separator(ui, palette);
+            if !matches!(state.tool, Tool::Counter) {
+                ui.label(RichText::new("Толщина").color(palette.text_secondary).size(12.0));
+                ui.add(egui::Slider::new(&mut state.thickness, 2.0..=12.0).show_value(false));
+                toolbar_separator(ui, palette);
+            }
+            for (name, color) in SWATCHES {
+                if swatch(ui, palette, color, name, state.color == color).clicked() {
+                    state.color = color;
+                }
+            }
+            return;
+        }
+
+        // Non-group layout (Выделение/Стрелка/Текст/Размытие/Обрезать):
+        // colours, then thickness, then the tool's own extra controls —
+        // unchanged from before the grouping.
         for (name, color) in SWATCHES {
             if swatch(ui, palette, color, name, state.color == color).clicked() {
                 state.color = color;
@@ -80,8 +169,7 @@ pub fn context_row(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette
 
         toolbar_separator(ui, palette);
 
-        // Thickness (hidden for tools that don't stroke).
-        if !matches!(state.tool, Tool::Select | Tool::Text | Tool::Counter | Tool::Crop) {
+        if !matches!(state.tool, Tool::Select | Tool::Text | Tool::Crop) {
             ui.label(RichText::new("Толщина").color(palette.text_secondary).size(12.0));
             ui.add(egui::Slider::new(&mut state.thickness, 2.0..=12.0).show_value(false));
         }
@@ -108,6 +196,21 @@ pub fn context_row(state: &mut EditorState, ui: &mut egui::Ui, palette: &Palette
             }
         }
     });
+}
+
+/// Row of icon-only subtype buttons for a group; the active subtype gets the
+/// accent pill (dark foreground, per `palette.accent_fg`'s contrast rule).
+fn subtype_picker(
+    state: &mut EditorState,
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    subtypes: &[(Tool, &'static str, &'static str)],
+) {
+    for &(tool, icon, label) in subtypes {
+        if icon_button(ui, palette, icon, label, state.tool == tool, true).clicked() {
+            state.set_tool(tool);
+        }
+    }
 }
 
 /// Bottom bar: zoom controls (left) and copy/save/share (right).

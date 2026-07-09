@@ -28,7 +28,7 @@ use crate::theme::{self, Palette, Theme};
 use crate::toast::{ToastAction, Toasts};
 
 /// Start-window size (tall enough for the first-run hint line).
-pub const START_SIZE: Vec2 = Vec2::new(420.0, 392.0);
+pub const START_SIZE: Vec2 = Vec2::new(420.0, 352.0);
 /// Editor window default size.
 const EDITOR_SIZE: Vec2 = Vec2::new(1120.0, 780.0);
 /// Settings-window host size (full-window settings content, see item 5).
@@ -38,7 +38,7 @@ const SETTINGS_SIZE: Vec2 = Vec2::new(540.0, 640.0);
 static HERO_PNG_BYTES: &[u8] = include_bytes!("../assets/skrino.png");
 /// Displayed width of the hero image (logical points); height follows the
 /// source's aspect ratio.
-const HERO_WIDTH: f32 = 150.0;
+const HERO_WIDTH: f32 = 100.0;
 /// Hard cap on how long a window-close waits for an in-flight share to finish
 /// before the process exits anyway (see [`SkrinoApp::handle_close_request`]).
 const SHARE_CLOSE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -854,13 +854,14 @@ fn draw_start(
         .frame(egui::Frame::new().fill(palette.window).inner_margin(egui::Margin::same(20)))
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(10.0);
+                ui.add_space(16.0);
                 if let Some(tex) = hero {
                     let size = tex.size_vec2();
                     let aspect = if size.x > 0.0 { size.y / size.x } else { 1.0 };
                     let draw_size = Vec2::new(HERO_WIDTH, HERO_WIDTH * aspect);
                     ui.add(egui::Image::new((tex.id(), draw_size)));
                 }
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new("Быстрые скриншоты")
                         .size(13.0)
