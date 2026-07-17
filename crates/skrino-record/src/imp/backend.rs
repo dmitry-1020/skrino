@@ -43,6 +43,7 @@ use windows_capture::settings::{
 };
 
 use super::clock::RecordClock;
+use super::flip;
 use super::geometry::{self, CropPlan, Rect};
 use super::pacing::FramePacer;
 use crate::{RecordError, RecordOptions};
@@ -149,7 +150,7 @@ impl GraphicsCaptureApiHandler for Handler {
         }
 
         let crop = self.shared.crop;
-        let fb = match frame.buffer_crop(
+        let mut fb = match frame.buffer_crop(
             crop.local_x,
             crop.local_y,
             crop.local_x + crop.width,
@@ -164,8 +165,23 @@ impl GraphicsCaptureApiHandler for Handler {
             }
         };
 
-        // Contiguous BGRA (row padding stripped into the reused scratch vec).
-        let bytes = fb.as_nopadding_buffer(&mut self.scratch);
+        // Depad and reverse row order in one pass: WGC rows are top-down, but
+        // send_frame_buffer's uncompressed BGRA sample follows the Media
+        // Foundation DIB convention (bottom-up); feeding top-down rows flips
+        // the video vertically. See `flip::pack_rows_bottom_up`.
+        let row_pitch = fb.row_pitch() as usize;
+        let src = fb.as_raw_buffer();
+        if !flip::pack_rows_bottom_up(
+            src,
+            crop.width as usize * 4,
+            row_pitch,
+            crop.height as usize,
+            &mut self.scratch,
+        ) {
+            log::warn!("skrino-record: unexpected frame layout, dropping frame");
+            return Ok(());
+        }
+        let bytes = self.scratch.as_slice();
 
         let mut state = self.shared.encode.lock().unwrap();
         if !state.pacer.accept_real(hns) {

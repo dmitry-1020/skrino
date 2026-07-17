@@ -12,6 +12,7 @@
 //! timeline excision) are unit-tested on any platform.
 
 mod clock;
+mod flip;
 mod geometry;
 mod pacing;
 

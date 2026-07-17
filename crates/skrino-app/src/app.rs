@@ -32,7 +32,7 @@ use crate::theme::{self, Palette, Theme};
 use crate::toast::{ToastAction, Toasts};
 
 /// Start-window size (tall enough for the recording row and first-run hint).
-pub const START_SIZE: Vec2 = Vec2::new(420.0, 468.0);
+pub const START_SIZE: Vec2 = Vec2::new(340.0, 440.0);
 /// Editor window default size.
 const EDITOR_SIZE: Vec2 = Vec2::new(1120.0, 780.0);
 /// Settings-window host size (full-window settings content, see item 5).
@@ -1280,7 +1280,8 @@ fn draw_start(
                         .color(palette.text_secondary),
                 );
                 ui.add_space(18.0);
-                let cards_width = 3.0 * MODE_CARD_SIZE.x + 2.0 * 8.0;
+                // Both card rows hold two entries each, so they share one width.
+                let cards_width = 2.0 * MODE_CARD_SIZE.x + 8.0;
                 let pad = ((ui.available_width() - cards_width) / 2.0).max(0.0);
                 ui.horizontal(|ui| {
                     ui.add_space(pad);
@@ -1291,16 +1292,11 @@ fn draw_start(
                     if mode_card(ui, palette, ph::MONITOR, "Весь экран", false).clicked() {
                         sig = StartSignal::Full;
                     }
-                    if mode_card(ui, palette, ph::FOLDER_OPEN, "Открыть файл", false).clicked() {
-                        sig = StartSignal::Open;
-                    }
                 });
                 ui.add_space(8.0);
                 // Second row: screen recording actions.
-                let rec_width = 2.0 * MODE_CARD_SIZE.x + 8.0;
-                let rec_pad = ((ui.available_width() - rec_width) / 2.0).max(0.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(rec_pad);
+                    ui.add_space(pad);
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if mode_card(ui, palette, ph::VIDEO_CAMERA, "Записать область", false).clicked() {
                         sig = StartSignal::RecordRegion;
@@ -1309,22 +1305,18 @@ fn draw_start(
                         sig = StartSignal::RecordFull;
                     }
                 });
-                ui.add_space(12.0);
+                ui.add_space(10.0);
+                // Secondary actions: opening a file and settings share the same
+                // low-emphasis link style, side by side.
                 ui.horizontal(|ui| {
                     let row = ui.available_width();
-                    let btns = 110.0;
+                    let btns = 250.0;
                     ui.add_space(((row - btns) / 2.0).max(0.0));
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(format!("{}  Настройки", ph::GEAR_SIX))
-                                    .color(palette.text_secondary)
-                                    .size(13.0),
-                            )
-                            .frame(false),
-                        )
-                        .clicked()
-                    {
+                    ui.spacing_mut().item_spacing.x = 16.0;
+                    if secondary_button(ui, palette, ph::FOLDER_OPEN, "Открыть файл").clicked() {
+                        sig = StartSignal::Open;
+                    }
+                    if secondary_button(ui, palette, ph::GEAR_SIX, "Настройки").clicked() {
                         sig = StartSignal::Settings;
                     }
                 });
@@ -1353,7 +1345,7 @@ fn draw_start(
     sig
 }
 
-const MODE_CARD_SIZE: Vec2 = Vec2::new(118.0, 74.0);
+const MODE_CARD_SIZE: Vec2 = Vec2::new(96.0, 60.0);
 
 /// Capture-mode card: icon on top, label below.
 fn mode_card(
@@ -1378,22 +1370,34 @@ fn mode_card(
         )
     };
     let painter = ui.painter();
-    painter.rect(rect, CornerRadius::same(9), fill, stroke, egui::StrokeKind::Inside);
+    painter.rect(rect, CornerRadius::same(8), fill, stroke, egui::StrokeKind::Inside);
     painter.text(
-        rect.center() - Vec2::new(0.0, 12.0),
+        rect.center() - Vec2::new(0.0, 10.0),
         egui::Align2::CENTER_CENTER,
         icon,
-        egui::FontId::proportional(22.0),
+        egui::FontId::proportional(18.0),
         fg,
     );
     painter.text(
-        rect.center() + Vec2::new(0.0, 16.0),
+        rect.center() + Vec2::new(0.0, 13.0),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(12.0),
         fg,
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Low-emphasis link-style action, used for "Открыть файл" and "Настройки".
+fn secondary_button(ui: &mut egui::Ui, palette: &Palette, icon: &str, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(format!("{icon}  {label}"))
+                .color(palette.text_secondary)
+                .size(13.0),
+        )
+        .frame(false),
+    )
 }
 
 /// Encode the rendered image to PNG or JPEG bytes.
