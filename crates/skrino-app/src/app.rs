@@ -1345,7 +1345,9 @@ fn draw_start(
     sig
 }
 
-const MODE_CARD_SIZE: Vec2 = Vec2::new(96.0, 60.0);
+// Wide enough for the longest label ("Записать область", ~98px at 12pt) plus
+// comfortable side margins; the painter draws labels without wrapping.
+const MODE_CARD_SIZE: Vec2 = Vec2::new(118.0, 62.0);
 
 /// Capture-mode card: icon on top, label below.
 fn mode_card(
