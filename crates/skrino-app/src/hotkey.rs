@@ -103,6 +103,8 @@ pub struct HotkeyRegistration {
     manager: GlobalHotKeyManager,
     region: Option<HotKey>,
     full: Option<HotKey>,
+    record: Option<HotKey>,
+    record_full: Option<HotKey>,
 }
 
 impl HotkeyRegistration {
@@ -112,6 +114,8 @@ impl HotkeyRegistration {
             manager,
             region: None,
             full: None,
+            record: None,
+            record_full: None,
         })
     }
 
@@ -125,6 +129,16 @@ impl HotkeyRegistration {
         self.full.map(|h| h.id())
     }
 
+    /// The id of the currently registered region-recording hotkey.
+    pub fn record_id(&self) -> Option<u32> {
+        self.record.map(|h| h.id())
+    }
+
+    /// The id of the currently registered full-monitor recording hotkey.
+    pub fn record_full_id(&self) -> Option<u32> {
+        self.record_full.map(|h| h.id())
+    }
+
     /// Register the region hotkey `spec`, replacing any previous region hotkey.
     pub fn set_region(&mut self, spec: &str) -> Result<(), String> {
         Self::set_slot(&self.manager, &mut self.region, spec)
@@ -133,6 +147,16 @@ impl HotkeyRegistration {
     /// Register the full-screen hotkey `spec`, replacing any previous one.
     pub fn set_full(&mut self, spec: &str) -> Result<(), String> {
         Self::set_slot(&self.manager, &mut self.full, spec)
+    }
+
+    /// Register the region-recording hotkey `spec`, replacing any previous one.
+    pub fn set_record(&mut self, spec: &str) -> Result<(), String> {
+        Self::set_slot(&self.manager, &mut self.record, spec)
+    }
+
+    /// Register the full-monitor recording hotkey `spec`, replacing any previous.
+    pub fn set_record_full(&mut self, spec: &str) -> Result<(), String> {
+        Self::set_slot(&self.manager, &mut self.record_full, spec)
     }
 
     fn set_slot(

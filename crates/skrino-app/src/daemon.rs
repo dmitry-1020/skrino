@@ -27,6 +27,7 @@ use tray_icon::menu::{MenuEvent, MenuId};
 
 use crate::config::AppConfig;
 use crate::hotkey::HotkeyRegistration;
+use crate::record;
 use crate::tray::{Tray, TrayCommand};
 
 /// Left tray-icon clicks within this window of the previous one are ignored
@@ -48,6 +49,8 @@ struct Daemon {
     hotkeys: Option<HotkeyRegistration>,
     region_id: Option<u32>,
     full_id: Option<u32>,
+    record_id: Option<u32>,
+    record_full_id: Option<u32>,
     initialized: bool,
     /// When the last left-click-triggered Start-window spawn happened (debounce).
     last_tray_open: Option<Instant>,
@@ -63,9 +66,24 @@ impl Daemon {
         }
     }
 
+    /// Recording hotkey / menu action: if a recording is already running, stop
+    /// it (stop-toggle IPC); otherwise spawn a fresh recording UI process.
+    fn toggle_recording(&self, flag: &str) {
+        if record::is_recording_active() {
+            record::signal_stop();
+        } else {
+            self.spawn_ui(flag);
+        }
+    }
+
     fn init(&mut self) {
         let config = AppConfig::load();
-        match Tray::new(&config.hotkey, &config.hotkey_full) {
+        match Tray::new(
+            &config.hotkey,
+            &config.hotkey_full,
+            &config.hotkey_record,
+            &config.hotkey_record_full,
+        ) {
             Ok(t) => self.tray = Some(t),
             Err(e) => log::error!("tray init failed: {e}"),
         }
@@ -83,13 +101,21 @@ impl Daemon {
             if let Err(e) = h.set_full(&config.hotkey_full) {
                 log::warn!("full hotkey register failed: {e}");
             }
+            if let Err(e) = h.set_record(&config.hotkey_record) {
+                log::warn!("record hotkey register failed: {e}");
+            }
+            if let Err(e) = h.set_record_full(&config.hotkey_record_full) {
+                log::warn!("record-full hotkey register failed: {e}");
+            }
         }
         self.region_id = hk.as_ref().and_then(|h| h.region_id());
         self.full_id = hk.as_ref().and_then(|h| h.full_id());
+        self.record_id = hk.as_ref().and_then(|h| h.record_id());
+        self.record_full_id = hk.as_ref().and_then(|h| h.record_full_id());
         self.hotkeys = hk;
     }
 
-    /// Re-read the config and re-register both hotkeys (after a settings change).
+    /// Re-read the config and re-register every hotkey (after a settings change).
     fn reload(&mut self) {
         let config = AppConfig::load();
         if let Some(h) = &mut self.hotkeys {
@@ -101,14 +127,29 @@ impl Daemon {
                 Ok(()) => self.full_id = h.full_id(),
                 Err(e) => log::warn!("full hotkey re-register failed: {e}"),
             }
+            match h.set_record(&config.hotkey_record) {
+                Ok(()) => self.record_id = h.record_id(),
+                Err(e) => log::warn!("record hotkey re-register failed: {e}"),
+            }
+            match h.set_record_full(&config.hotkey_record_full) {
+                Ok(()) => self.record_full_id = h.record_full_id(),
+                Err(e) => log::warn!("record-full hotkey re-register failed: {e}"),
+            }
         }
         if let Some(t) = &self.tray {
-            t.set_hotkeys(&config.hotkey, &config.hotkey_full);
+            t.set_hotkeys(
+                &config.hotkey,
+                &config.hotkey_full,
+                &config.hotkey_record,
+                &config.hotkey_record_full,
+            );
         }
         log::info!(
-            "daemon reloaded config (region: {}, full: {})",
+            "daemon reloaded config (region: {}, full: {}, record: {}, record-full: {})",
             config.hotkey,
-            config.hotkey_full
+            config.hotkey_full,
+            config.hotkey_record,
+            config.hotkey_record_full
         );
     }
 
@@ -156,6 +197,8 @@ impl ApplicationHandler<UserEvent> for Daemon {
                 match cmd {
                     Some(TrayCommand::CaptureRegion) => self.spawn_ui("--capture-region"),
                     Some(TrayCommand::CaptureFull) => self.spawn_ui("--capture-full"),
+                    Some(TrayCommand::RecordRegion) => self.toggle_recording("--record-region"),
+                    Some(TrayCommand::RecordFull) => self.toggle_recording("--record-full"),
                     Some(TrayCommand::OpenFile) => self.spawn_ui("--open-file"),
                     Some(TrayCommand::StartWindow) => self.spawn_ui("--start"),
                     Some(TrayCommand::Settings) => self.spawn_ui("--settings"),
@@ -171,6 +214,10 @@ impl ApplicationHandler<UserEvent> for Daemon {
                     self.spawn_ui("--capture-region");
                 } else if Some(id) == self.full_id {
                     self.spawn_ui("--capture-full");
+                } else if Some(id) == self.record_id {
+                    self.toggle_recording("--record-region");
+                } else if Some(id) == self.record_full_id {
+                    self.toggle_recording("--record-full");
                 }
             }
             UserEvent::Tray(ev) => self.handle_tray_event(ev),
@@ -222,6 +269,8 @@ pub fn run() {
         hotkeys: None,
         region_id: None,
         full_id: None,
+        record_id: None,
+        record_full_id: None,
         initialized: false,
         last_tray_open: None,
     };

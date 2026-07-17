@@ -134,6 +134,8 @@ impl SettingsWindow {
                         ui.add_space(12.0);
                         section_card(ui, palette, |ui| self.save_section(ui, &mut work, palette));
                         ui.add_space(12.0);
+                        section_card(ui, palette, |ui| self.record_section(ui, &mut work, palette));
+                        ui.add_space(12.0);
                         section_card(ui, palette, |ui| self.general_section(ui, &mut work, palette));
                         ui.add_space(4.0);
                     });
@@ -195,7 +197,10 @@ impl SettingsWindow {
     /// keychain, and persist. Returns which side-effect-worthy fields changed.
     fn commit(&mut self, cfg: &mut AppConfig, work: AppConfig) -> CommitChanged {
         let changed = CommitChanged {
-            hotkey: cfg.hotkey != work.hotkey || cfg.hotkey_full != work.hotkey_full,
+            hotkey: cfg.hotkey != work.hotkey
+                || cfg.hotkey_full != work.hotkey_full
+                || cfg.hotkey_record != work.hotkey_record
+                || cfg.hotkey_record_full != work.hotkey_record_full,
             autostart: cfg.autostart != work.autostart,
         };
         *cfg = work;
@@ -406,6 +411,36 @@ impl SettingsWindow {
         });
     }
 
+    /// «Запись»: recording hotkeys, frame rate and cursor capture.
+    fn record_section(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, palette: &Palette) {
+        section_header(ui, palette, "Запись");
+
+        egui::Grid::new("record_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Запись области");
+                hotkey_field(ui, palette, &mut cfg.hotkey_record, "Ctrl+Shift+5");
+                ui.end_row();
+
+                ui.label("Запись всего экрана");
+                hotkey_field(ui, palette, &mut cfg.hotkey_record_full, "Ctrl+Shift+6");
+                ui.end_row();
+
+                ui.label("Кадров в секунду");
+                ComboBox::from_id_salt("record_fps")
+                    .selected_text(format!("{}", cfg.record_fps))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut cfg.record_fps, 15, "15");
+                        ui.selectable_value(&mut cfg.record_fps, 30, "30");
+                        ui.selectable_value(&mut cfg.record_fps, 60, "60");
+                    });
+                ui.end_row();
+            });
+
+        ui.checkbox(&mut cfg.record_cursor, "Записывать курсор");
+    }
+
     fn general_section(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, palette: &Palette) {
         section_header(ui, palette, "Общие");
 
@@ -494,8 +529,18 @@ fn validate(work: &AppConfig) -> Result<(), String> {
         .map_err(|_| "Горячая клавиша «Область» указана неверно".to_string())?;
     let full = crate::hotkey::parse(&work.hotkey_full)
         .map_err(|_| "Горячая клавиша «Весь экран» указана неверно".to_string())?;
-    if region == full {
-        return Err("Горячие клавиши «Область» и «Весь экран» должны различаться".into());
+    let record = crate::hotkey::parse(&work.hotkey_record)
+        .map_err(|_| "Горячая клавиша «Запись области» указана неверно".to_string())?;
+    let record_full = crate::hotkey::parse(&work.hotkey_record_full)
+        .map_err(|_| "Горячая клавиша «Запись экрана» указана неверно".to_string())?;
+    // All four global hotkeys must be distinct or the OS registration collides.
+    let all = [region, full, record, record_full];
+    for i in 0..all.len() {
+        for j in (i + 1)..all.len() {
+            if all[i] == all[j] {
+                return Err("Все горячие клавиши должны различаться".into());
+            }
+        }
     }
     if work.upload.port == 0 {
         return Err("Порт должен быть больше нуля".into());

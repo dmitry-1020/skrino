@@ -17,6 +17,8 @@ mod editor;
 mod hotkey;
 mod notify;
 mod overlay;
+mod record;
+mod record_frame;
 mod settings_ui;
 mod share;
 mod theme;
@@ -53,6 +55,13 @@ fn main() {
         return;
     }
 
+    // Automated-test-safe recording smoke test: fully headless (no eframe/window),
+    // the only recording mode allowed to auto-run. Records the primary monitor
+    // for 3s, prints the .mp4 path, exits.
+    if std::env::args().any(|a| a == "--record-smoke") {
+        record::run_smoke();
+    }
+
     let mode = parse_mode();
     let config = AppConfig::load();
 
@@ -66,9 +75,9 @@ fn main() {
     // reshapes the root window on its first frame (capture happens first).
     let start_visible = matches!(mode, LaunchMode::Start);
     let initial_size: Vec2 = match mode {
-        LaunchMode::Start => Vec2::new(420.0, 392.0),
+        LaunchMode::Start => Vec2::new(420.0, 468.0),
         LaunchMode::Settings => Vec2::new(540.0, 620.0),
-        _ => Vec2::new(420.0, 392.0),
+        _ => Vec2::new(420.0, 468.0),
     };
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -104,6 +113,8 @@ fn parse_mode() -> LaunchMode {
         match arg.as_str() {
             "--capture-region" => return LaunchMode::CaptureRegion,
             "--capture-full" => return LaunchMode::CaptureFull,
+            "--record-region" => return LaunchMode::RecordRegion,
+            "--record-full" => return LaunchMode::RecordFull,
             "--open-file" => return LaunchMode::OpenFile,
             "--settings" => return LaunchMode::Settings,
             "--overlay-smoke" => return LaunchMode::OverlaySmoke,
@@ -124,6 +135,8 @@ mod arg_tests {
             match arg {
                 "--capture-region" => return LaunchMode::CaptureRegion,
                 "--capture-full" => return LaunchMode::CaptureFull,
+                "--record-region" => return LaunchMode::RecordRegion,
+                "--record-full" => return LaunchMode::RecordFull,
                 "--open-file" => return LaunchMode::OpenFile,
                 "--settings" => return LaunchMode::Settings,
                 "--overlay-smoke" => return LaunchMode::OverlaySmoke,
@@ -144,6 +157,8 @@ mod arg_tests {
     fn each_flag_maps_to_its_mode() {
         assert_eq!(mode_from(["--capture-region"]), LaunchMode::CaptureRegion);
         assert_eq!(mode_from(["--capture-full"]), LaunchMode::CaptureFull);
+        assert_eq!(mode_from(["--record-region"]), LaunchMode::RecordRegion);
+        assert_eq!(mode_from(["--record-full"]), LaunchMode::RecordFull);
         assert_eq!(mode_from(["--open-file"]), LaunchMode::OpenFile);
         assert_eq!(mode_from(["--settings"]), LaunchMode::Settings);
         assert_eq!(mode_from(["--overlay-smoke"]), LaunchMode::OverlaySmoke);

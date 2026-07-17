@@ -162,6 +162,20 @@ pub struct AppConfig {
     /// so old configs (which lack the key) fall back via `default_hotkey_full`.
     #[serde(default = "default_hotkey_full")]
     pub hotkey_full: String,
+    /// Global hotkey that starts (and, while a recording is active, stops)
+    /// a region screen recording. Added later, so old configs fall back via
+    /// `default_hotkey_record`.
+    #[serde(default = "default_hotkey_record")]
+    pub hotkey_record: String,
+    /// Global hotkey for full-monitor screen recording (start/stop toggle).
+    #[serde(default = "default_hotkey_record_full")]
+    pub hotkey_record_full: String,
+    /// Recording frame rate (frames per second): 15, 30 or 60.
+    #[serde(default = "default_record_fps")]
+    pub record_fps: u32,
+    /// Whether the mouse cursor is drawn into the recording.
+    #[serde(default = "default_true")]
+    pub record_cursor: bool,
     pub format: ImageFormat,
     /// JPEG quality 1..=100 (ignored for PNG).
     pub jpeg_quality: u8,
@@ -200,12 +214,31 @@ fn default_hotkey_full() -> String {
     "Ctrl+Shift+4".to_string()
 }
 
+/// Default region-recording hotkey (also `#[serde(default)]` for old configs).
+fn default_hotkey_record() -> String {
+    "Ctrl+Shift+5".to_string()
+}
+
+/// Default full-monitor recording hotkey.
+fn default_hotkey_record_full() -> String {
+    "Ctrl+Shift+6".to_string()
+}
+
+/// Default recording frame rate.
+fn default_record_fps() -> u32 {
+    30
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: Theme::Light,
             hotkey: "Ctrl+Shift+3".to_string(),
             hotkey_full: default_hotkey_full(),
+            hotkey_record: default_hotkey_record(),
+            hotkey_record_full: default_hotkey_record_full(),
+            record_fps: default_record_fps(),
+            record_cursor: true,
             format: ImageFormat::Png,
             jpeg_quality: 90,
             autostart: false,
@@ -355,6 +388,10 @@ mod tests {
         cfg.save_dir = Some(PathBuf::from("C:/shots"));
         cfg.ask_where_to_save = false;
         cfg.notifications = false;
+        cfg.hotkey_record = "Ctrl+Alt+5".into();
+        cfg.hotkey_record_full = "Ctrl+Alt+6".into();
+        cfg.record_fps = 60;
+        cfg.record_cursor = false;
         cfg.upload.host = "example.com".into();
         cfg.upload.protocol = Protocol::Ftps;
         cfg.upload.url_template = "https://example.com/s/{filename}".into();
@@ -474,6 +511,42 @@ mod tests {
         assert!(crate::hotkey::parse(&cfg.hotkey).is_ok());
         assert!(crate::hotkey::parse(&cfg.hotkey_full).is_ok());
         assert_ne!(cfg.hotkey, cfg.hotkey_full);
+    }
+
+    #[test]
+    fn default_record_hotkeys_and_options() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.hotkey_record, "Ctrl+Shift+5");
+        assert_eq!(cfg.hotkey_record_full, "Ctrl+Shift+6");
+        assert_eq!(cfg.record_fps, 30);
+        assert!(cfg.record_cursor);
+        // Record hotkeys must parse and be distinct from each other and the
+        // capture hotkeys.
+        assert!(crate::hotkey::parse(&cfg.hotkey_record).is_ok());
+        assert!(crate::hotkey::parse(&cfg.hotkey_record_full).is_ok());
+        for a in [&cfg.hotkey, &cfg.hotkey_full, &cfg.hotkey_record] {
+            assert_ne!(a, &cfg.hotkey_record_full);
+        }
+        assert_ne!(cfg.hotkey_record, cfg.hotkey_record_full);
+    }
+
+    #[test]
+    fn old_config_without_record_fields_gets_defaults() {
+        // Earlier configs predate recording entirely; every record field must
+        // fall back to its default while the rest of the config loads.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(back.hotkey_record, "Ctrl+Shift+5");
+        assert_eq!(back.hotkey_record_full, "Ctrl+Shift+6");
+        assert_eq!(back.record_fps, 30);
+        assert!(back.record_cursor);
     }
 
     #[test]

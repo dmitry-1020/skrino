@@ -35,9 +35,22 @@ use egui::{
     TextureOptions, Vec2,
 };
 use image::RgbaImage;
+use skrino_record::RegionPx;
 
 use crate::theme::Palette;
 use crate::transform::OverlayTransform;
+
+/// What the overlay's confirmed selection feeds into. The same overlay code and
+/// window handling serve both; only the hint text and the confirmed outcome
+/// differ (a cropped image for a screenshot, a virtual-screen region for a
+/// recording).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OverlayPurpose {
+    /// Crop the selection out of the frozen capture and hand it to the editor.
+    Screenshot,
+    /// Report the selection as a physical-pixel region to start recording.
+    Record,
+}
 
 /// Hard safety cap: an overlay left up this long auto-cancels so a stuck
 /// fullscreen surface can never require a reboot.
@@ -51,14 +64,28 @@ pub enum OverlayOutcome {
     Pending,
     /// User pressed Esc / right-clicked / timed out.
     Cancelled,
-    /// Confirmed; the cropped physical-pixel image is ready for the editor.
-    Confirmed(RgbaImage),
+    /// Screenshot purpose confirmed: the cropped physical-pixel image is ready
+    /// for the editor.
+    Screenshot(RgbaImage),
+    /// Record purpose confirmed: the selected region in virtual-screen physical
+    /// pixels, ready to start recording.
+    Region(RegionPx),
 }
 
 pub struct OverlayState {
     /// Target monitor's portion of the capture, physical pixels.
     image: RgbaImage,
     transform: OverlayTransform,
+    /// What a confirmed selection feeds into (screenshot vs recording).
+    purpose: OverlayPurpose,
+    /// Target monitor's top-left in virtual-screen physical pixels. Pixel (0, 0)
+    /// of `image` maps to this point, so a selection's image-pixel rect plus this
+    /// offset gives the virtual-screen [`RegionPx`] the recorder captures.
+    mon_x: i32,
+    mon_y: i32,
+    /// Monitor DPI scale (physical / logical), stored for the control-bar layout
+    /// after a record selection is confirmed.
+    scale: f32,
     /// Desired root-window outer position (logical points).
     pos_pt: Pos2,
     /// Desired root-window inner size (logical points).
@@ -79,13 +106,30 @@ pub struct OverlayState {
 
 impl OverlayState {
     /// `image` is the monitor slice; `scale` its DPI scale; `pos_pt`/`size_pt`
-    /// the root-window geometry (logical points) the app should apply.
-    pub fn new(image: RgbaImage, scale: f32, pos_pt: Pos2, size_pt: Vec2, smoke: bool) -> Self {
+    /// the root-window geometry (logical points) the app should apply;
+    /// `mon_x`/`mon_y` the monitor's top-left in virtual-screen physical pixels;
+    /// `purpose` whether a confirmed selection becomes a screenshot or a
+    /// recording region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        image: RgbaImage,
+        scale: f32,
+        pos_pt: Pos2,
+        size_pt: Vec2,
+        mon_x: i32,
+        mon_y: i32,
+        purpose: OverlayPurpose,
+        smoke: bool,
+    ) -> Self {
         let scale = if scale > 0.0 { scale } else { 1.0 };
         let (w, h) = (image.width(), image.height());
         Self {
             transform: OverlayTransform::new(scale, w, h),
             image,
+            purpose,
+            mon_x,
+            mon_y,
+            scale,
             pos_pt,
             size_pt,
             texture: None,
@@ -96,6 +140,11 @@ impl OverlayState {
             started: Instant::now(),
             smoke,
         }
+    }
+
+    /// Monitor DPI scale (physical / logical) of the overlaid monitor.
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     /// Desired root-window outer position (logical points).
@@ -221,14 +270,17 @@ impl OverlayState {
                     painter.line_segment([Pos2::new(cursor.x, full.min.y), Pos2::new(cursor.x, full.max.y)], s);
                 }
 
-                // Hint at top-centre.
+                // Hint at top-centre (wording depends on the overlay purpose).
                 let hint_pos = Pos2::new(full.center().x, full.min.y + 22.0);
-                draw_hint(
-                    &painter,
-                    hint_pos,
-                    "Выделите область  •  Esc или правый клик: отмена",
-                    palette,
-                );
+                let hint = match self.purpose {
+                    OverlayPurpose::Screenshot => {
+                        "Выделите область  •  Esc или правый клик: отмена"
+                    }
+                    OverlayPurpose::Record => {
+                        "Выделите область для записи  •  Esc или правый клик: отмена"
+                    }
+                };
+                draw_hint(&painter, hint_pos, hint, palette);
 
                 // "ОК" button once a selection is committed.
                 if let Some(sel) = self.committed {
@@ -289,8 +341,20 @@ impl OverlayState {
         if w == 0 || h == 0 {
             return OverlayOutcome::Cancelled;
         }
-        let cropped = image::imageops::crop_imm(&self.image, x, y, w, h).to_image();
-        OverlayOutcome::Confirmed(cropped)
+        match self.purpose {
+            OverlayPurpose::Screenshot => {
+                let cropped = image::imageops::crop_imm(&self.image, x, y, w, h).to_image();
+                OverlayOutcome::Screenshot(cropped)
+            }
+            OverlayPurpose::Record => OverlayOutcome::Region(RegionPx {
+                // `x`/`y` are image-pixel offsets into the monitor slice, whose
+                // origin is the monitor's virtual-screen top-left.
+                x: self.mon_x + x as i32,
+                y: self.mon_y + y as i32,
+                width: w,
+                height: h,
+            }),
+        }
     }
 }
 

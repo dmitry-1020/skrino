@@ -1,0 +1,22 @@
+[package]
+name = "skrino-record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+
+# Windows-only capture + encode pipeline. windows-capture 2.x wraps
+# Windows.Graphics.Capture and ships a Media Foundation H.264/HEVC VideoEncoder
+# whose `send_frame_buffer(buffer, timestamp)` lets us stamp frames ourselves —
+# required for excising paused spans from the output timeline. It pins
+# `windows` 0.62, so we match that exact version to avoid a duplicate build.
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2"
+windows = { version = "0.62", features = [
+    "Graphics_Capture",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+] }

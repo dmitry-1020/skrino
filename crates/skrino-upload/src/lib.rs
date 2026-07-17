@@ -152,7 +152,8 @@ mod tests {
             return false;
         }
         let is_digit = |b: u8| b.is_ascii_digit();
-        let checks: [(usize, fn(u8) -> bool); 20] = [
+        type ByteCheck = fn(u8) -> bool;
+        let checks: [(usize, ByteCheck); 20] = [
             (0, is_digit),
             (1, is_digit),
             (2, is_digit),

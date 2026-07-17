@@ -12,6 +12,8 @@ use tray_icon::{
 pub enum TrayCommand {
     CaptureRegion,
     CaptureFull,
+    RecordRegion,
+    RecordFull,
     OpenFile,
     StartWindow,
     Settings,
@@ -22,8 +24,12 @@ pub struct Tray {
     _tray: TrayIcon,
     region: MenuItem,
     full: MenuItem,
+    record: MenuItem,
+    record_full: MenuItem,
     id_region: MenuId,
     id_full: MenuId,
+    id_record: MenuId,
+    id_record_full: MenuId,
     id_open: MenuId,
     id_start: MenuId,
     id_settings: MenuId,
@@ -31,9 +37,16 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(hotkey: &str, hotkey_full: &str) -> Result<Self, String> {
+    pub fn new(
+        hotkey: &str,
+        hotkey_full: &str,
+        hotkey_record: &str,
+        hotkey_record_full: &str,
+    ) -> Result<Self, String> {
         let region = MenuItem::new(region_label(hotkey), true, None);
         let full = MenuItem::new(full_label(hotkey_full), true, None);
+        let record = MenuItem::new(record_label(hotkey_record), true, None);
+        let record_full = MenuItem::new(record_full_label(hotkey_record_full), true, None);
         let open = MenuItem::new("Открыть файл…", true, None);
         let start = MenuItem::new("Открыть окно запуска", true, None);
         let settings = MenuItem::new("Настройки", true, None);
@@ -42,8 +55,19 @@ impl Tray {
         let menu = Menu::new();
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
+        let sep3 = PredefinedMenuItem::separator();
         menu.append_items(&[
-            &region, &full, &open, &sep1, &start, &settings, &sep2, &quit,
+            &region,
+            &full,
+            &sep1,
+            &record,
+            &record_full,
+            &open,
+            &sep2,
+            &start,
+            &settings,
+            &sep3,
+            &quit,
         ])
         .map_err(|e| e.to_string())?;
 
@@ -60,20 +84,32 @@ impl Tray {
         Ok(Self {
             id_region: region.id().clone(),
             id_full: full.id().clone(),
+            id_record: record.id().clone(),
+            id_record_full: record_full.id().clone(),
             id_open: open.id().clone(),
             id_start: start.id().clone(),
             id_settings: settings.id().clone(),
             id_quit: quit.id().clone(),
             region,
             full,
+            record,
+            record_full,
             _tray: tray,
         })
     }
 
-    /// Update the capture menu items to show the current hotkeys.
-    pub fn set_hotkeys(&self, hotkey: &str, hotkey_full: &str) {
+    /// Update the capture and recording menu items to show the current hotkeys.
+    pub fn set_hotkeys(
+        &self,
+        hotkey: &str,
+        hotkey_full: &str,
+        hotkey_record: &str,
+        hotkey_record_full: &str,
+    ) {
         self.region.set_text(region_label(hotkey));
         self.full.set_text(full_label(hotkey_full));
+        self.record.set_text(record_label(hotkey_record));
+        self.record_full.set_text(record_full_label(hotkey_record_full));
     }
 
     /// Map an incoming menu-event id to a command.
@@ -82,6 +118,10 @@ impl Tray {
             Some(TrayCommand::CaptureRegion)
         } else if id == &self.id_full {
             Some(TrayCommand::CaptureFull)
+        } else if id == &self.id_record {
+            Some(TrayCommand::RecordRegion)
+        } else if id == &self.id_record_full {
+            Some(TrayCommand::RecordFull)
         } else if id == &self.id_open {
             Some(TrayCommand::OpenFile)
         } else if id == &self.id_start {
@@ -109,6 +149,22 @@ fn full_label(hotkey: &str) -> String {
         "Скриншот всего экрана".to_string()
     } else {
         format!("Скриншот всего экрана   {hotkey}")
+    }
+}
+
+fn record_label(hotkey: &str) -> String {
+    if hotkey.trim().is_empty() {
+        "Записать область".to_string()
+    } else {
+        format!("Записать область   {hotkey}")
+    }
+}
+
+fn record_full_label(hotkey: &str) -> String {
+    if hotkey.trim().is_empty() {
+        "Записать весь экран".to_string()
+    } else {
+        format!("Записать весь экран   {hotkey}")
     }
 }
 

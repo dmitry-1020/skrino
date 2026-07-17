@@ -11,6 +11,8 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::{CornerRadius, Pos2, RichText, Sense, Stroke, Vec2, ViewportCommand, WindowLevel};
@@ -18,17 +20,19 @@ use egui_phosphor::regular as ph;
 use image::RgbaImage;
 use skrino_capture::{MonitorInfo, VirtualScreenCapture};
 use skrino_core::render::{RenderOptions, render_document};
+use skrino_record::RegionPx;
 
 use crate::config::{AppConfig, ImageFormat, ShareDestination};
 use crate::editor::{EditorSignal, EditorState};
-use crate::overlay::{OverlayOutcome, OverlayState};
+use crate::overlay::{OverlayOutcome, OverlayPurpose, OverlayState};
+use crate::record::{self, RecordSession, RecordSignal, RecordingLock};
 use crate::settings_ui::{SettingsResult, SettingsWindow};
 use crate::share::{ShareHandle, ShareResult};
 use crate::theme::{self, Palette, Theme};
 use crate::toast::{ToastAction, Toasts};
 
-/// Start-window size (tall enough for the first-run hint line).
-pub const START_SIZE: Vec2 = Vec2::new(420.0, 352.0);
+/// Start-window size (tall enough for the recording row and first-run hint).
+pub const START_SIZE: Vec2 = Vec2::new(420.0, 468.0);
 /// Editor window default size.
 const EDITOR_SIZE: Vec2 = Vec2::new(1120.0, 780.0);
 /// Settings-window host size (full-window settings content, see item 5).
@@ -52,6 +56,10 @@ pub enum LaunchMode {
     CaptureRegion,
     /// Capture the full screen straight to the editor.
     CaptureFull,
+    /// Region overlay that starts a screen recording of the chosen area.
+    RecordRegion,
+    /// Record the monitor under the cursor, no overlay.
+    RecordFull,
     /// File-open dialog straight to the editor.
     OpenFile,
     /// Settings window alone.
@@ -70,6 +78,8 @@ enum AppState {
     Overlay(Box<OverlayState>),
     /// Main editor.
     Editor(Box<EditorState>),
+    /// Active recording: the compact control bar in the (reshaped) root viewport.
+    Recording(Box<RecordSession>),
     /// Settings-only launch: nothing behind the settings window.
     SettingsOnly,
 }
@@ -93,6 +103,8 @@ enum WindowMode {
     Editor,
     Settings,
     Overlay { pos: Pos2, size: Vec2 },
+    /// Compact always-on-top recording control bar.
+    ControlBar { pos: Pos2, size: Vec2 },
 }
 
 pub struct SkrinoApp {
@@ -119,6 +131,12 @@ pub struct SkrinoApp {
     close_deadline: Option<Instant>,
     /// The Start-window hero image, decoded once and reused every frame.
     hero_texture: Option<egui::TextureHandle>,
+    /// Single-instance recording lock, held for the recording process lifetime.
+    record_lock: Option<RecordingLock>,
+    /// Set by the hotkey stop watcher when a stop is requested cross-process.
+    record_stop: Option<Arc<AtomicBool>>,
+    /// In-flight upload of a finished recording (server share destination).
+    record_share: Option<ShareHandle>,
 }
 
 impl SkrinoApp {
@@ -142,6 +160,9 @@ impl SkrinoApp {
             pending_close: false,
             close_deadline: None,
             hero_texture,
+            record_lock: None,
+            record_stop: None,
+            record_share: None,
         }
     }
 
@@ -167,12 +188,14 @@ impl SkrinoApp {
     }
 
     /// First-frame dispatch based on the launch mode.
-    fn dispatch_launch(&mut self) {
+    fn dispatch_launch(&mut self, ctx: &egui::Context) {
         self.state = match self.launch {
             LaunchMode::Start => AppState::Start,
             LaunchMode::CaptureRegion => self.begin_region_capture(false),
             LaunchMode::OverlaySmoke => self.begin_region_capture(true),
             LaunchMode::CaptureFull => self.begin_full_capture(),
+            LaunchMode::RecordRegion => self.begin_record_region(ctx),
+            LaunchMode::RecordFull => self.begin_record_full(ctx),
             LaunchMode::OpenFile => self.begin_open_file(),
             LaunchMode::Settings => {
                 self.settings.open = true;
@@ -185,7 +208,7 @@ impl SkrinoApp {
 
     fn begin_region_capture(&mut self, smoke: bool) -> AppState {
         match catch_unwind(AssertUnwindSafe(skrino_capture::capture_virtual_screen)) {
-            Ok(Ok(cap)) => match build_overlay(cap, smoke) {
+            Ok(Ok(cap)) => match build_overlay(cap, OverlayPurpose::Screenshot, smoke) {
                 Some(ov) => AppState::Overlay(Box::new(ov)),
                 None => {
                     self.toasts.error("Не удалось подготовить область выделения");
@@ -232,6 +255,246 @@ impl SkrinoApp {
                 self.toasts.error(format!("Не удалось открыть файл: {e}"));
                 self.finish()
             }
+        }
+    }
+
+    // --- recording entry points ---
+
+    /// Fail fast if the engine is unavailable or a recording already runs;
+    /// otherwise acquire the single-instance lock and start the stop watcher.
+    /// Returns `Err(state)` (an exit state) when recording must not proceed.
+    fn arm_recording(&mut self, ctx: &egui::Context) -> Result<(), AppState> {
+        if !skrino_record::is_supported() {
+            crate::notify::notify(
+                "Запись экрана не поддерживается",
+                "Нужна Windows 10 версии 1903 или новее",
+                self.config.notifications,
+            );
+            return Err(self.finish());
+        }
+        let Some(lock) = RecordingLock::acquire() else {
+            crate::notify::notify(
+                "Запись уже идёт",
+                "Остановите текущую запись, прежде чем начать новую",
+                self.config.notifications,
+            );
+            return Err(self.finish());
+        };
+        self.record_lock = Some(lock);
+        self.record_stop = Some(record::spawn_stop_watcher(ctx.clone()));
+        Ok(())
+    }
+
+    /// `--record-region`: region overlay, then start recording the selection.
+    fn begin_record_region(&mut self, ctx: &egui::Context) -> AppState {
+        if let Err(state) = self.arm_recording(ctx) {
+            return state;
+        }
+        match catch_unwind(AssertUnwindSafe(skrino_capture::capture_virtual_screen)) {
+            Ok(Ok(cap)) => match build_overlay(cap, OverlayPurpose::Record, false) {
+                Some(ov) => AppState::Overlay(Box::new(ov)),
+                None => {
+                    crate::notify::notify(
+                        "Не удалось начать запись",
+                        "Не удалось подготовить область выделения",
+                        self.config.notifications,
+                    );
+                    self.finish()
+                }
+            },
+            _ => {
+                crate::notify::notify(
+                    "Не удалось начать запись",
+                    "Модуль захвата экрана недоступен",
+                    self.config.notifications,
+                );
+                self.finish()
+            }
+        }
+    }
+
+    /// `--record-full`: record the monitor under the cursor, no overlay.
+    fn begin_record_full(&mut self, ctx: &egui::Context) -> AppState {
+        if let Err(state) = self.arm_recording(ctx) {
+            return state;
+        }
+        let (region, scale) = record::full_monitor_region();
+        AppState::Recording(Box::new(self.new_record_session(region, scale)))
+    }
+
+    /// Build a recording session from the shared config options.
+    fn new_record_session(&self, region: Option<RegionPx>, scale: f32) -> RecordSession {
+        let stop_flag = self
+            .record_stop
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        RecordSession::new(
+            region,
+            scale,
+            self.config.record_fps,
+            self.config.record_cursor,
+            record::temp_output_path(),
+            stop_flag,
+        )
+    }
+
+    /// Overlay confirmed a record region: start the session on that area.
+    fn begin_recording(&mut self, region: RegionPx, scale: f32) -> AppState {
+        AppState::Recording(Box::new(self.new_record_session(Some(region), scale)))
+    }
+
+    /// Whether the hotkey watcher has requested a stop (non-consuming peek).
+    fn record_stop_requested(&self) -> bool {
+        self.record_stop
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Acquire))
+    }
+
+    // --- recording result pipeline ---
+
+    /// Stop button / stop hotkey: finalize the recording per the share
+    /// destination. Local saves and upload failures exit immediately; a server
+    /// upload switches the control bar to its spinner and exits when it lands.
+    fn finalize_recording(&mut self, sess: &mut RecordSession, ctx: &egui::Context) {
+        let Some(recorder) = sess.take_recorder() else {
+            self.quit();
+        };
+        let path = match recorder.stop() {
+            Ok(p) => p,
+            Err(e) => {
+                crate::notify::notify(
+                    "Не удалось сохранить запись",
+                    e.to_string(),
+                    self.config.notifications,
+                );
+                self.quit();
+            }
+        };
+        match self.config.share_dest.clone() {
+            ShareDestination::Server => {
+                if self.start_recording_upload(&path) {
+                    sess.set_finalizing();
+                    ctx.request_repaint();
+                } else {
+                    self.quit();
+                }
+            }
+            ShareDestination::LocalDir { .. } => {
+                self.save_recording_local(&path);
+                self.quit();
+            }
+        }
+    }
+
+    /// Kick off the mp4 upload. Returns `false` (already notified) when upload
+    /// isn't configured or the file can't be read — the caller then exits.
+    fn start_recording_upload(&mut self, path: &Path) -> bool {
+        let Some(config) = self.config.upload.to_upload_config() else {
+            let kept = move_into_dir(path, &AppConfig::fallback_dir());
+            let where_ = kept.unwrap_or_else(|| path.to_path_buf());
+            crate::notify::notify(
+                "Не удалось отправить запись",
+                format!("Настройте загрузку в параметрах. Файл сохранён: {}", where_.display()),
+                self.config.notifications,
+            );
+            return false;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::notify::notify(
+                    "Не удалось отправить запись",
+                    format!("Не удалось прочитать файл: {e}"),
+                    self.config.notifications,
+                );
+                return false;
+            }
+        };
+        let filename = match catch_unwind(|| skrino_upload::generate_filename("mp4")) {
+            Ok(name) => name,
+            Err(_) => "skrino.mp4".to_string(),
+        };
+        self.record_share = Some(ShareHandle::spawn(
+            config,
+            filename,
+            bytes,
+            AppConfig::fallback_dir(),
+        ));
+        // The temp file has been read into memory; the upload worker owns a copy.
+        let _ = std::fs::remove_file(path);
+        true
+    }
+
+    /// Poll a finished-recording upload; on completion notify and exit.
+    fn poll_record_share(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &mut self.record_share else {
+            return;
+        };
+        if handle.in_flight() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        if let Some(res) = handle.poll() {
+            match res {
+                ShareResult::Success(url) => {
+                    let _ = arboard::Clipboard::new()
+                        .and_then(|mut cb| cb.set_text(url.clone()));
+                    crate::notify::notify(
+                        "Ссылка скопирована в буфер",
+                        url,
+                        self.config.notifications,
+                    );
+                }
+                ShareResult::Failure { error, saved_to, .. } => {
+                    let extra = saved_to
+                        .map(|p| format!(" Файл сохранён: {}", p.display()))
+                        .unwrap_or_default();
+                    crate::notify::notify(
+                        "Не удалось отправить запись",
+                        format!("{error}{extra}"),
+                        self.config.notifications,
+                    );
+                }
+            }
+            self.record_share = None;
+            self.quit();
+        }
+    }
+
+    /// Save the recording into the configured save folder, honouring
+    /// `ask_where_to_save` (rfd dialog with an .mp4 filter). A cancelled dialog
+    /// still keeps the recording (saved silently into the default folder).
+    fn save_recording_local(&mut self, path: &Path) {
+        let filename = match catch_unwind(|| skrino_upload::generate_filename("mp4")) {
+            Ok(name) => name,
+            Err(_) => "skrino.mp4".to_string(),
+        };
+        let dir = self.config.default_save_dir();
+        let _ = std::fs::create_dir_all(&dir);
+
+        let dest = if self.config.ask_where_to_save {
+            rfd::FileDialog::new()
+                .set_title("Сохранить запись")
+                .set_directory(&dir)
+                .set_file_name(&filename)
+                .add_filter("Видео", &["mp4"])
+                .save_file()
+                // Cancel: don't lose the recording, drop it into the default folder.
+                .unwrap_or_else(|| dir.join(&filename))
+        } else {
+            dir.join(&filename)
+        };
+
+        match move_file(path, &dest) {
+            Ok(()) => crate::notify::notify(
+                "Запись сохранена",
+                dest.display().to_string(),
+                self.config.notifications,
+            ),
+            Err(e) => crate::notify::notify(
+                "Не удалось сохранить запись",
+                format!("{e} (файл: {})", path.display()),
+                self.config.notifications,
+            ),
         }
     }
 
@@ -553,6 +816,10 @@ impl SkrinoApp {
                 pos: ov.window_pos(),
                 size: ov.window_size(),
             },
+            AppState::Recording(sess) => WindowMode::ControlBar {
+                pos: sess.window_pos(),
+                size: sess.window_size(),
+            },
             AppState::Editor(_) => WindowMode::Editor,
             AppState::SettingsOnly => WindowMode::Settings,
             AppState::Start => {
@@ -591,12 +858,24 @@ impl SkrinoApp {
                 send(ViewportCommand::Visible(true));
                 send(ViewportCommand::Focus);
             }
+            WindowMode::ControlBar { pos, size } => {
+                // Transition the root window from the fullscreen overlay (or the
+                // hidden boot window) into the compact, borderless, always-on-top
+                // control bar. Transition-only: sent once, on the state change.
+                send(ViewportCommand::Fullscreen(false));
+                send(ViewportCommand::Decorations(false));
+                send(ViewportCommand::Resizable(false));
+                send(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+                send(ViewportCommand::InnerSize(*size));
+                send(ViewportCommand::OuterPosition(*pos));
+                send(ViewportCommand::Visible(true));
+            }
         }
     }
 
     // --- main content dispatch ---
 
-    fn draw_main(&mut self, ctx: &egui::Context, palette: &Palette) {
+    fn draw_main(&mut self, ctx: &egui::Context, frame: &eframe::Frame, palette: &Palette) {
         let mut state = std::mem::replace(&mut self.state, AppState::Boot);
         let mut next: Option<AppState> = None;
 
@@ -625,6 +904,8 @@ impl SkrinoApp {
                 StartSignal::Region => next = Some(self.begin_region_capture(false)),
                 StartSignal::Full => next = Some(self.begin_full_capture()),
                 StartSignal::Open => next = Some(self.begin_open_file()),
+                StartSignal::RecordRegion => next = Some(self.begin_record_region(ctx)),
+                StartSignal::RecordFull => next = Some(self.begin_record_full(ctx)),
                 StartSignal::Settings => self.settings.open = true,
                 StartSignal::None => {}
             },
@@ -660,12 +941,43 @@ impl SkrinoApp {
                     EditorSignal::None => {}
                 }
             }
-            AppState::Overlay(ov) => match ov.run(ctx, palette) {
-                OverlayOutcome::Confirmed(img) => {
-                    next = Some(AppState::Editor(Box::new(EditorState::new(img))));
+            AppState::Overlay(ov) => {
+                // A stop hotkey fired during a record-region selection cancels it.
+                if self.record_stop_requested() {
+                    next = Some(self.finish());
+                } else {
+                    match ov.run(ctx, palette) {
+                        OverlayOutcome::Screenshot(img) => {
+                            next = Some(AppState::Editor(Box::new(EditorState::new(img))));
+                        }
+                        OverlayOutcome::Region(region) => {
+                            next = Some(self.begin_recording(region, ov.scale()));
+                        }
+                        OverlayOutcome::Cancelled => next = Some(self.finish()),
+                        OverlayOutcome::Pending => {}
+                    }
                 }
-                OverlayOutcome::Cancelled => next = Some(self.finish()),
-                OverlayOutcome::Pending => {}
+            }
+            AppState::Recording(sess) => match sess.ui(ctx, frame, palette) {
+                RecordSignal::None => {}
+                RecordSignal::Stop => self.finalize_recording(sess, ctx),
+                RecordSignal::Cancel => {
+                    if let Some(rec) = sess.take_recorder() {
+                        rec.cancel();
+                    }
+                    self.quit();
+                }
+                RecordSignal::Error(e) => {
+                    crate::notify::notify(
+                        "Ошибка записи экрана",
+                        e,
+                        self.config.notifications,
+                    );
+                    if let Some(rec) = sess.take_recorder() {
+                        rec.cancel();
+                    }
+                    self.quit();
+                }
             },
         }
 
@@ -727,9 +1039,9 @@ impl eframe::App for SkrinoApp {
             .to_normalized_gamma_f32()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if matches!(self.state, AppState::Boot) {
-            self.dispatch_launch();
+            self.dispatch_launch(ctx);
         }
 
         if self.applied_theme != Some(self.config.theme) {
@@ -745,7 +1057,7 @@ impl eframe::App for SkrinoApp {
             self.applied_window = Some(wanted);
         }
 
-        self.draw_main(ctx, &palette);
+        self.draw_main(ctx, frame, &palette);
 
         // Settings-only launch exits when its window closes.
         if matches!(self.launch, LaunchMode::Settings) && !self.settings.open {
@@ -778,6 +1090,7 @@ impl eframe::App for SkrinoApp {
         }
 
         self.poll_share(ctx);
+        self.poll_record_share(ctx);
         self.handle_close_request(ctx);
     }
 }
@@ -804,8 +1117,14 @@ fn windowed(ctx: &egui::Context, size: Vec2, title: &str) {
 }
 
 /// Build the overlay for the monitor under the cursor: crop that monitor's slice
-/// out of the virtual-screen capture and compute the root-window geometry.
-fn build_overlay(cap: VirtualScreenCapture, smoke: bool) -> Option<OverlayState> {
+/// out of the virtual-screen capture and compute the root-window geometry. The
+/// same overlay serves screenshots and recordings; `purpose` decides what a
+/// confirmed selection becomes.
+fn build_overlay(
+    cap: VirtualScreenCapture,
+    purpose: OverlayPurpose,
+    smoke: bool,
+) -> Option<OverlayState> {
     let cursor = cursor_pos();
     let monitor = pick_monitor(&cap, cursor)?.clone();
 
@@ -832,7 +1151,31 @@ fn build_overlay(cap: VirtualScreenCapture, smoke: bool) -> Option<OverlayState>
     let pos_pt = Pos2::new(monitor.x as f32 / scale, monitor.y as f32 / scale);
     let size_pt = Vec2::new(w as f32 / scale, h as f32 / scale);
 
-    Some(OverlayState::new(slice, scale, pos_pt, size_pt, smoke))
+    Some(OverlayState::new(
+        slice, scale, pos_pt, size_pt, monitor.x, monitor.y, purpose, smoke,
+    ))
+}
+
+/// Move a file to `dest` (rename, falling back to copy+delete across volumes).
+fn move_file(from: &Path, dest: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::rename(from, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(from, dest)?;
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+    }
+}
+
+/// Move `from` into `dir` keeping its file name. Returns the destination path.
+fn move_into_dir(from: &Path, dir: &Path) -> Option<std::path::PathBuf> {
+    let name = from.file_name()?;
+    let dest = dir.join(name);
+    move_file(from, &dest).ok().map(|()| dest)
 }
 
 /// Choose the monitor under the cursor, else the primary, else the first.
@@ -906,6 +1249,8 @@ enum StartSignal {
     Region,
     Full,
     Open,
+    RecordRegion,
+    RecordFull,
     Settings,
 }
 
@@ -948,6 +1293,20 @@ fn draw_start(
                     }
                     if mode_card(ui, palette, ph::FOLDER_OPEN, "Открыть файл", false).clicked() {
                         sig = StartSignal::Open;
+                    }
+                });
+                ui.add_space(8.0);
+                // Second row: screen recording actions.
+                let rec_width = 2.0 * MODE_CARD_SIZE.x + 8.0;
+                let rec_pad = ((ui.available_width() - rec_width) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(rec_pad);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if mode_card(ui, palette, ph::VIDEO_CAMERA, "Записать область", false).clicked() {
+                        sig = StartSignal::RecordRegion;
+                    }
+                    if mode_card(ui, palette, ph::MONITOR_PLAY, "Записать экран", false).clicked() {
+                        sig = StartSignal::RecordFull;
                     }
                 });
                 ui.add_space(12.0);

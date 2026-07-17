@@ -4,6 +4,7 @@ members = [
     "crates/skrino-core",
     "crates/skrino-capture",
     "crates/skrino-upload",
+    "crates/skrino-record",
     "crates/skrino-app",
 ]
 
