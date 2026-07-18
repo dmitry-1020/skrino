@@ -1,0 +1,39 @@
+Skrino
+Copyright (c) 2026 dmitry-1020. All rights reserved.
+
+This source code is made publicly available for reference and evaluation
+purposes only. It is NOT open-source software.
+
+PERMITTED
+- You may view and read this source code.
+- You may download and run the official pre-built binary (skrino.exe) as
+  distributed by the copyright holder, for your own personal use.
+
+NOT PERMITTED without prior written permission from the copyright holder
+- Copying, reproducing, or storing the source code or any part of it, other
+  than the transient copy your browser or Git client makes in order to display
+  or check it out for viewing.
+- Modifying the code or creating derivative works based on it.
+- Redistributing, publishing, mirroring, sublicensing, renting, selling, or
+  otherwise making available the source code or the binary, in original or
+  modified form.
+- Incorporating the code or any part of it into another project, product, or
+  service.
+
+THIRD-PARTY COMPONENTS
+Third-party components bundled with or used by this software (for example the
+Inter and Phosphor fonts, and all Rust crate dependencies) remain under their
+own respective licenses; see THIRD-PARTY-NOTICES.md. Nothing in this license
+restricts, or purports to restrict, your rights under those licenses with
+respect to those components.
+
+NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For any use beyond what is permitted above, contact the copyright holder to
+request written permission.

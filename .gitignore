@@ -1,1 +1,4 @@
 /target
+
+# Local Claude Code settings (per-machine permissions, not for the repo)
+.claude/
