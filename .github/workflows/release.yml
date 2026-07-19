@@ -1,0 +1,41 @@
+name: release
+
+# Build skrino.exe and publish a GitHub Release whenever a version tag is
+# pushed, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (stable)
+        run: rustup update stable && rustup default stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Assemble release notes with checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash target/release/skrino.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "SHA-256: $hash"
+          $body = Get-Content .github/release-body.md -Raw
+          $body = $body -replace '<SHA256>', $hash
+          $body | Out-File -Encoding utf8 notes.md
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME target/release/skrino.exe `
+            --title "Skrino $env:GITHUB_REF_NAME" `
+            --notes-file notes.md
