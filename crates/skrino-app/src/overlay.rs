@@ -219,7 +219,10 @@ impl OverlayState {
                     if let (Some(a), Some(b)) = (self.drag_start, self.drag_cur) {
                         let r = Rect::from_two_pos(a, b);
                         if r.width() >= 3.0 && r.height() >= 3.0 {
+                            // Releasing the drag IS the confirmation: go straight
+                            // to the editor / recording, no separate "ОК" click.
                             self.committed = Some(r);
+                            result = self.confirm();
                         }
                     }
                 }
@@ -281,27 +284,6 @@ impl OverlayState {
                     }
                 };
                 draw_hint(&painter, hint_pos, hint, palette);
-
-                // "ОК" button once a selection is committed.
-                if let Some(sel) = self.committed {
-                    let btn_size = Vec2::new(66.0, 30.0);
-                    let btn_pos = Pos2::new(
-                        (sel.max.x - btn_size.x).max(full.min.x + 4.0),
-                        (sel.max.y + 8.0).min(full.max.y - btn_size.y - 4.0),
-                    );
-                    let btn_rect = Rect::from_min_size(btn_pos, btn_size);
-                    let ok = ui.put(
-                        btn_rect,
-                        egui::Button::new(
-                            egui::RichText::new("ОК").color(palette.accent_fg).strong(),
-                        )
-                        .fill(palette.accent)
-                        .corner_radius(CornerRadius::same(8)),
-                    );
-                    if ok.clicked() {
-                        result = self.confirm();
-                    }
-                }
 
                 // --- keyboard / gesture confirm & cancel ---
                 if esc || secondary {
