@@ -2,3 +2,6 @@
 
 # Local Claude Code settings (per-machine permissions, not for the repo)
 .claude/
+
+# Maintainer-only release notes, kept out of the public repo
+/RELEASING.md
