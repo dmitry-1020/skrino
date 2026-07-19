@@ -36,6 +36,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create $env:GITHUB_REF_NAME target/release/skrino.exe `
-            --title "Skrino $env:GITHUB_REF_NAME" `
-            --notes-file notes.md
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Release already exists (e.g. created by hand or a re-run): refresh
+            # its notes and overwrite the binary instead of failing.
+            gh release edit $tag --title "Skrino $tag" --notes-file notes.md
+            gh release upload $tag target/release/skrino.exe --clobber
+          } else {
+            gh release create $tag target/release/skrino.exe `
+              --title "Skrino $tag" `
+              --notes-file notes.md
+          }
