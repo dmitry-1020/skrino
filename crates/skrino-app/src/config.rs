@@ -31,6 +31,34 @@ impl ImageFormat {
     }
 }
 
+/// Which audio source the recorder mixes into the .mp4. Mirrors
+/// [`skrino_record::AudioSource`] but owns its own serde derives (the engine
+/// enum has none), so the choice can be persisted; a `#[serde(default)]` on the
+/// config field keeps old configs (which lack it) loading as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioSource {
+    /// No audio track is written; the recording is video-only (default).
+    #[default]
+    None,
+    /// System playback (WASAPI loopback of the default output device).
+    System,
+    /// The default microphone / capture device.
+    Microphone,
+}
+
+impl AudioSource {
+    /// Map to the recording engine's audio source, applied where a recording
+    /// actually starts (`skrino_record` derives no serde, so config owns its
+    /// own copy of the enum).
+    pub fn to_record(self) -> skrino_record::AudioSource {
+        match self {
+            AudioSource::None => skrino_record::AudioSource::None,
+            AudioSource::System => skrino_record::AudioSource::System,
+            AudioSource::Microphone => skrino_record::AudioSource::Microphone,
+        }
+    }
+}
+
 /// Where the editor's «Поделиться» button sends the rendered screenshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ShareDestination {
@@ -176,6 +204,11 @@ pub struct AppConfig {
     /// Whether the mouse cursor is drawn into the recording.
     #[serde(default = "default_true")]
     pub record_cursor: bool,
+    /// Which single audio source, if any, is recorded alongside the video.
+    /// Added later, so old configs fall back to `None` (video only, matching
+    /// the previous behaviour).
+    #[serde(default)]
+    pub record_audio: AudioSource,
     pub format: ImageFormat,
     /// JPEG quality 1..=100 (ignored for PNG).
     pub jpeg_quality: u8,
@@ -239,6 +272,7 @@ impl Default for AppConfig {
             hotkey_record_full: default_hotkey_record_full(),
             record_fps: default_record_fps(),
             record_cursor: true,
+            record_audio: AudioSource::None,
             format: ImageFormat::Png,
             jpeg_quality: 90,
             autostart: false,
@@ -392,6 +426,7 @@ mod tests {
         cfg.hotkey_record_full = "Ctrl+Alt+6".into();
         cfg.record_fps = 60;
         cfg.record_cursor = false;
+        cfg.record_audio = AudioSource::Microphone;
         cfg.upload.host = "example.com".into();
         cfg.upload.protocol = Protocol::Ftps;
         cfg.upload.url_template = "https://example.com/s/{filename}".into();
@@ -547,6 +582,50 @@ mod tests {
         assert_eq!(back.hotkey_record_full, "Ctrl+Shift+6");
         assert_eq!(back.record_fps, 30);
         assert!(back.record_cursor);
+        // Audio predates none of these; it must default to no audio.
+        assert_eq!(back.record_audio, AudioSource::None);
+    }
+
+    #[test]
+    fn default_record_audio_is_none() {
+        assert_eq!(AppConfig::default().record_audio, AudioSource::None);
+        // The default maps to the engine's no-audio source.
+        assert_eq!(
+            AudioSource::None.to_record(),
+            skrino_record::AudioSource::None
+        );
+    }
+
+    #[test]
+    fn record_audio_variants_map_to_engine() {
+        assert_eq!(
+            AudioSource::System.to_record(),
+            skrino_record::AudioSource::System
+        );
+        assert_eq!(
+            AudioSource::Microphone.to_record(),
+            skrino_record::AudioSource::Microphone
+        );
+    }
+
+    #[test]
+    fn old_config_without_record_audio_defaults_to_none() {
+        // A config.json that predates the audio field must load with audio off.
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "record_fps": 60,
+            "record_cursor": false,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(back.record_audio, AudioSource::None);
+        // The neighbouring record fields still load from the old JSON.
+        assert_eq!(back.record_fps, 60);
+        assert!(!back.record_cursor);
     }
 
     #[test]

@@ -90,12 +90,15 @@ pub struct RecordSession {
 impl RecordSession {
     /// Build a session. `region` is the capture area in virtual-screen physical
     /// pixels (`None` = primary monitor); `scale` the monitor DPI scale;
-    /// `output` the temp .mp4 path; `stop_flag` shared with the hotkey watcher.
+    /// `audio` the single audio source (if any) to record; `output` the temp
+    /// .mp4 path; `stop_flag` shared with the hotkey watcher.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         region: Option<RegionPx>,
         scale: f32,
         fps: u32,
         capture_cursor: bool,
+        audio: skrino_record::AudioSource,
         output: PathBuf,
         stop_flag: Arc<AtomicBool>,
     ) -> Self {
@@ -105,6 +108,7 @@ impl RecordSession {
             region,
             fps,
             capture_cursor,
+            audio,
             output,
         };
         Self {
@@ -448,6 +452,7 @@ pub fn run_smoke() -> ! {
         region: None,
         fps: 30,
         capture_cursor: true,
+        audio: skrino_record::AudioSource::None,
         output,
     };
     match Recorder::start(opts) {

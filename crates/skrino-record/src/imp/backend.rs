@@ -22,8 +22,10 @@
 //! monotonicity check suppress keepalives too. The result has no frozen
 //! stretch and no jump.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -42,11 +44,13 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
+use super::audio_dsp::{DST_SAMPLE_RATE, StereoResampler};
+use super::audio_wasapi::{AudioCapturer, AudioSel};
 use super::clock::RecordClock;
 use super::flip;
 use super::geometry::{self, CropPlan, Rect};
 use super::pacing::FramePacer;
-use crate::{RecordError, RecordOptions};
+use crate::{AudioSource, RecordError, RecordOptions};
 
 /// Cheap WGC availability probe. `GraphicsCaptureSession::IsSupported` is a
 /// static metadata check (Windows 10 1903+); on any failure we assume no.
@@ -258,9 +262,208 @@ fn watchdog_loop(shared: &Shared) {
     }
 }
 
+// --- Single-source audio capture ---------------------------------------------
+//
+// The encoder derives audio time from the cumulative count of sample frames it
+// has been handed (`audio_samples_sent * 10^7 / sample_rate`), so the stream
+// must be continuous at 48 kHz with no gaps. The audio thread therefore feeds
+// the encoder purely by the active clock: it queues resampled real audio and,
+// each tick, tops the queue up with silence so cumulative frames sent tracks
+// `RecordClock::active` wall time. While paused the active clock is frozen, so
+// no frames are due and none are sent, keeping A/V aligned across pauses without
+// injecting a silent gap.
+
+/// Encoder audio frame = 2 channels * 2 bytes (i16 stereo at [`DST_SAMPLE_RATE`]).
+const AUDIO_BYTES_PER_FRAME: usize = 4;
+
+/// Audio feed cadence. 10 ms (~480 frames at 48 kHz) keeps latency low without
+/// spinning; the WASAPI client buffer (200 ms) absorbs any poll jitter.
+const AUDIO_TICK: Duration = Duration::from_millis(10);
+
+/// Cap on queued-but-unsent real audio (~0.5 s). A capture device clock running
+/// slightly faster than the system clock would otherwise build unbounded
+/// latency; excess oldest frames are dropped, trading a sub-perceptible skip for
+/// staying locked to the clock-driven target.
+const AUDIO_MAX_PENDING_FRAMES: usize = (DST_SAMPLE_RATE as usize) / 2;
+
+/// Number of 48 kHz stereo frames that should have been emitted by active time
+/// `active_hns` (100 ns ticks). Saturates at zero for a non-positive clock.
+fn audio_target_frames(active_hns: i64) -> u64 {
+    if active_hns <= 0 {
+        return 0;
+    }
+    ((active_hns as i128 * i128::from(DST_SAMPLE_RATE)) / 10_000_000i128) as u64
+}
+
+/// Feed `need` stereo frames to the encoder: real audio from `pending` first,
+/// then silence for any shortfall. Returns `false` if the encoder rejected the
+/// buffer (audio then stops; video is unaffected).
+fn emit_audio_frames(
+    shared: &Shared,
+    pending: &mut VecDeque<i16>,
+    need: usize,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    if need == 0 {
+        return true;
+    }
+    scratch.clear();
+    scratch.reserve(need * AUDIO_BYTES_PER_FRAME);
+    let mut remaining = need;
+    while remaining > 0 {
+        let (Some(l), Some(r)) = (pending.pop_front(), pending.pop_front()) else {
+            break;
+        };
+        scratch.extend_from_slice(&l.to_le_bytes());
+        scratch.extend_from_slice(&r.to_le_bytes());
+        remaining -= 1;
+    }
+    // Silence pads the remaining shortfall (leading warm-up, gaps, drained queue).
+    scratch.resize(need * AUDIO_BYTES_PER_FRAME, 0);
+
+    let mut state = shared.encode.lock().unwrap();
+    if let Some(encoder) = state.encoder.as_mut() {
+        // The encoder ignores the timestamp and clocks off the sample count.
+        if let Err(e) = encoder.send_audio_buffer(scratch, 0) {
+            log::warn!("skrino-record: audio send failed, stopping audio track: {e}");
+            return false;
+        }
+    }
+    true
+}
+
+/// Audio streaming loop: drain WASAPI, resample to 48 kHz stereo i16, and feed
+/// the encoder paced by the active clock. Runs on the dedicated audio thread and
+/// exits on `shutdown`/`cancelled`.
+fn audio_loop(shared: &Shared, cap: &mut AudioCapturer) {
+    let mut resampler = StereoResampler::new(cap.sample_rate(), DST_SAMPLE_RATE);
+    let mut capture_buf: Vec<f32> = Vec::new();
+    let mut resampled: Vec<i16> = Vec::new();
+    let mut pending: VecDeque<i16> = VecDeque::new();
+    let mut send_scratch: Vec<u8> = Vec::new();
+    let mut frames_emitted: u64 = 0;
+    let mut was_paused = false;
+
+    loop {
+        std::thread::sleep(AUDIO_TICK);
+
+        if shared.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let shutting_down = shared.shutdown.load(Ordering::Acquire);
+
+        // Always drain the device so its buffer never overflows, even if we then
+        // discard the data (paused).
+        capture_buf.clear();
+        if let Err(e) = cap.capture_into(&mut capture_buf) {
+            // A transient device read failure must not crash the recording; keep
+            // the stream alive by padding silence for this span.
+            log::warn!("skrino-record: audio capture failed: {e}");
+            capture_buf.clear();
+        }
+
+        if shared.paused.load(Ordering::Acquire) {
+            // Excise this span: drop captured audio and the queued backlog, and
+            // re-prime the resampler so resumed audio does not interpolate across
+            // the discarded gap. The active clock is frozen, so no frames are due.
+            pending.clear();
+            resampler.reset();
+            was_paused = true;
+            if shutting_down {
+                return;
+            }
+            continue;
+        }
+        if was_paused {
+            // On resume, realign the emit target to the current active time so
+            // the pause span is not back-filled with silence.
+            frames_emitted = audio_target_frames(shared.clock.lock().unwrap().active_hns(Instant::now()));
+            was_paused = false;
+        }
+
+        if !capture_buf.is_empty() {
+            resampled.clear();
+            resampler.process(&capture_buf, &mut resampled);
+            pending.extend(resampled.iter().copied());
+            // Bound queued latency (interleaved i16: two entries per frame).
+            let max_entries = AUDIO_MAX_PENDING_FRAMES * 2;
+            while pending.len() > max_entries {
+                pending.pop_front();
+            }
+        }
+
+        let active_hns = shared.clock.lock().unwrap().active_hns(Instant::now());
+        let target = audio_target_frames(active_hns);
+        if target > frames_emitted {
+            let need = (target - frames_emitted) as usize;
+            if !emit_audio_frames(shared, &mut pending, need, &mut send_scratch) {
+                return; // encoder rejected audio; leave video running
+            }
+            frames_emitted = target;
+        }
+
+        if shutting_down {
+            return;
+        }
+    }
+}
+
+/// Map the public audio choice to the capture selector; `None` means no track.
+fn audio_selection(source: AudioSource) -> Option<AudioSel> {
+    match source {
+        AudioSource::None => None,
+        AudioSource::System => Some(AudioSel::Loopback),
+        AudioSource::Microphone => Some(AudioSel::Microphone),
+    }
+}
+
+/// Start the audio capture thread and block until WASAPI has initialized, so the
+/// caller knows whether to enable the encoder's AAC track. On success the thread
+/// waits for `run_rx` to deliver the shared pipeline, then streams audio.
+/// On init failure the thread has already exited and `Err` is returned so the
+/// recording proceeds video-only.
+fn spawn_audio_thread(
+    source: AudioSel,
+    run_rx: mpsc::Receiver<Arc<Shared>>,
+) -> Result<JoinHandle<()>, String> {
+    let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+    let handle = std::thread::Builder::new()
+        .name("skrino-record-audio".into())
+        .spawn(move || {
+            // Phase A: initialize WASAPI on this thread (owns the COM apartment).
+            let mut cap = match AudioCapturer::new(source) {
+                Ok(cap) => {
+                    let _ = init_tx.send(Ok(()));
+                    cap
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+            // Phase B: wait for the pipeline. A dropped sender means start() gave
+            // up after our init; just exit.
+            if let Ok(shared) = run_rx.recv() {
+                audio_loop(&shared, &mut cap);
+            }
+        })
+        .map_err(|e| format!("не удалось запустить аудиопоток: {e}"))?;
+
+    match init_rx.recv() {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(e)) => {
+            let _ = handle.join();
+            Err(e)
+        }
+        Err(_) => Err("аудиопоток завершился до инициализации".into()),
+    }
+}
+
 pub(crate) struct RecorderImpl {
     control: Option<CaptureControl<Handler, HandlerError>>,
     watchdog: Option<JoinHandle<()>>,
+    /// Audio capture thread; `None` when no source was selected or init failed.
+    audio: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
     output: PathBuf,
 }
@@ -307,13 +510,36 @@ impl RecorderImpl {
             .nth(plan.monitor_index)
             .ok_or_else(|| RecordError::Capture("выбранный монитор недоступен".into()))?;
 
+        // Bring up audio capture before the encoder: the AAC track must be
+        // enabled at encoder-creation time, and we only enable it once WASAPI has
+        // actually initialized. On any audio failure we log and record video-only
+        // rather than aborting the whole recording. The thread is handed the
+        // shared pipeline via `run_tx` once the encoder exists.
+        let (run_tx, run_rx) = mpsc::channel::<Arc<Shared>>();
+        let mut audio_handle: Option<JoinHandle<()>> = None;
+        let audio_enabled = match audio_selection(opts.audio) {
+            Some(sel) => match spawn_audio_thread(sel, run_rx) {
+                Ok(handle) => {
+                    audio_handle = Some(handle);
+                    true
+                }
+                Err(e) => {
+                    log::warn!("skrino-record: звук недоступен, запись без звука: {e}");
+                    false
+                }
+            },
+            None => false,
+        };
+
         // Create the encoder up front so a bad output path or missing codec
         // fails fast here instead of asynchronously on the capture thread.
         let video = VideoSettingsBuilder::new(plan.width, plan.height)
             .frame_rate(fps)
             .bitrate(BITRATE_BPS)
             .sub_type(VideoSettingsSubType::H264);
-        let audio = AudioSettingsBuilder::new().disabled(true);
+        // Defaults (48 kHz / stereo / 16-bit / AAC) match the audio thread's
+        // output format; enabled only when a source is actually capturing.
+        let audio = AudioSettingsBuilder::new().disabled(!audio_enabled);
         let container = ContainerSettingsBuilder::new();
         let encoder = VideoEncoder::new(video, audio, container, &opts.output)
             .map_err(|e| RecordError::Encoder(format!("не удалось создать кодировщик: {e}")))?;
@@ -367,9 +593,19 @@ impl RecorderImpl {
                 RecordError::Capture(format!("не удалось запустить поток записи: {e}"))
             })?;
 
+        // Hand the live pipeline to the waiting audio thread so it starts
+        // streaming into the encoder. (On the `?` error paths above, `run_tx` is
+        // dropped instead, and the audio thread exits cleanly on the closed
+        // channel.)
+        if audio_handle.is_some() && run_tx.send(Arc::clone(&shared)).is_err() {
+            log::warn!("skrino-record: аудиопоток недоступен, запись без звука");
+            audio_handle = None;
+        }
+
         Ok(Self {
             control: Some(control),
             watchdog: Some(watchdog),
+            audio: audio_handle,
             shared,
             output: opts.output,
         })
@@ -409,6 +645,12 @@ impl RecorderImpl {
         }
         if let Some(watchdog) = self.watchdog.take() {
             let _ = watchdog.join();
+        }
+        // Join the audio thread before the encoder is finalized/dropped so its
+        // final flush completes and it stops touching the encoder. It observes
+        // `shutdown`/`cancelled` and drains within one `AUDIO_TICK`.
+        if let Some(audio) = self.audio.take() {
+            let _ = audio.join();
         }
     }
 
@@ -514,6 +756,7 @@ mod tests {
             region: None,
             fps: 30,
             capture_cursor: true,
+            audio: AudioSource::None,
             output: output.clone(),
         };
 
@@ -549,6 +792,48 @@ mod tests {
             meta.len(),
             output.display(),
             elapsed
+        );
+        let _ = std::fs::remove_file(&output);
+    }
+
+    /// Real end-to-end audio test: records ~2s of the primary monitor with system
+    /// (loopback) audio and asserts the mp4 carries an AAC audio track. Ignored by
+    /// default (needs a live desktop, hardware encoder, and a default render
+    /// device); run with:
+    ///   cargo test -p skrino-record -- --ignored records_with_system_audio
+    #[test]
+    #[ignore = "records the real screen + system audio; run explicitly with --ignored"]
+    fn records_with_system_audio_writes_aac_track() {
+        let dir = std::env::temp_dir();
+        let output = dir.join(format!("skrino-record-audio-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        let opts = RecordOptions {
+            region: None,
+            fps: 30,
+            capture_cursor: false,
+            audio: AudioSource::System,
+            output: output.clone(),
+        };
+
+        let recorder = RecorderImpl::start(opts).expect("recording should start");
+        std::thread::sleep(Duration::from_millis(2000));
+        assert!(recorder.take_error().is_none(), "no mid-recording error");
+        let path = recorder.stop().expect("stop should finalize the mp4");
+
+        let bytes = std::fs::read(&path).expect("output file should exist");
+        assert!(bytes.len() > 10_240, "mp4 too small: {} bytes", bytes.len());
+
+        // The AAC sample-entry box type `mp4a` appears in the audio track's stsd;
+        // its presence proves a muxed audio track exists (no full mp4 parser
+        // needed). Video-only files never contain it.
+        let has_aac = bytes.windows(4).any(|w| w == b"mp4a");
+        assert!(has_aac, "expected an AAC (mp4a) audio track in the mp4");
+
+        eprintln!(
+            "recorded {} bytes to {} with audio track (mp4a: {has_aac})",
+            bytes.len(),
+            path.display(),
         );
         let _ = std::fs::remove_file(&output);
     }

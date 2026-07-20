@@ -33,8 +33,25 @@ pub struct RecordOptions {
     pub fps: u32,
     /// Whether the mouse cursor is drawn into the recording.
     pub capture_cursor: bool,
+    /// Which single audio source, if any, is recorded into the mp4 alongside
+    /// the video. No mixing: at most one source at a time.
+    pub audio: AudioSource,
     /// Destination .mp4 path. Parent directory must exist.
     pub output: PathBuf,
+}
+
+/// The audio source mixed into a recording. Only one at a time (no mixing of
+/// system playback and microphone together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioSource {
+    /// No audio track is written; the mp4 is video-only.
+    #[default]
+    None,
+    /// System playback: WASAPI loopback of the default render (output) device,
+    /// i.e. whatever is being played on the machine.
+    System,
+    /// The default microphone / capture device.
+    Microphone,
 }
 
 #[derive(Debug, thiserror::Error)]

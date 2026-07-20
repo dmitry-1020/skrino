@@ -20,7 +20,7 @@ use std::sync::mpsc::Receiver;
 use egui::{Align, ComboBox, CornerRadius, Layout, RichText};
 use skrino_upload::{Protocol, UploadConfig};
 
-use crate::config::{AppConfig, ImageFormat, ShareDestination};
+use crate::config::{AppConfig, AudioSource, ImageFormat, ShareDestination};
 use crate::theme::{Palette, Theme};
 
 /// What the app should act on after the settings window ran this frame.
@@ -436,6 +436,28 @@ impl SettingsWindow {
                         ui.selectable_value(&mut cfg.record_fps, 60, "60");
                     });
                 ui.end_row();
+
+                ui.label("Звук");
+                ComboBox::from_id_salt("record_audio")
+                    .selected_text(audio_source_name(cfg.record_audio))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut cfg.record_audio,
+                            AudioSource::None,
+                            audio_source_name(AudioSource::None),
+                        );
+                        ui.selectable_value(
+                            &mut cfg.record_audio,
+                            AudioSource::System,
+                            audio_source_name(AudioSource::System),
+                        );
+                        ui.selectable_value(
+                            &mut cfg.record_audio,
+                            AudioSource::Microphone,
+                            audio_source_name(AudioSource::Microphone),
+                        );
+                    });
+                ui.end_row();
             });
 
         ui.checkbox(&mut cfg.record_cursor, "Записывать курсор");
@@ -600,5 +622,13 @@ fn protocol_name(p: Protocol) -> &'static str {
         Protocol::Ftp => "FTP",
         Protocol::Ftps => "FTPS",
         Protocol::Sftp => "SFTP",
+    }
+}
+
+fn audio_source_name(a: AudioSource) -> &'static str {
+    match a {
+        AudioSource::None => "Нет",
+        AudioSource::System => "Системный звук",
+        AudioSource::Microphone => "Микрофон",
     }
 }

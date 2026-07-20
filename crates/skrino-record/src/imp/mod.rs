@@ -17,6 +17,10 @@ mod geometry;
 mod pacing;
 
 #[cfg(windows)]
+mod audio_dsp;
+#[cfg(windows)]
+mod audio_wasapi;
+#[cfg(windows)]
 mod backend;
 #[cfg(windows)]
 pub(crate) use backend::{RecorderImpl, is_supported};

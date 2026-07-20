@@ -333,6 +333,7 @@ impl SkrinoApp {
             scale,
             self.config.record_fps,
             self.config.record_cursor,
+            self.config.record_audio.to_record(),
             record::temp_output_path(),
             stop_flag,
         )
