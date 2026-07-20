@@ -4846,7 +4846,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "skrino-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4879,7 +4879,7 @@ dependencies = [
 
 [[package]]
 name = "skrino-capture"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "image",
@@ -4890,7 +4890,7 @@ dependencies = [
 
 [[package]]
 name = "skrino-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4903,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "skrino-record"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "thiserror 2.0.18",
@@ -4913,7 +4913,7 @@ dependencies = [
 
 [[package]]
 name = "skrino-upload"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
