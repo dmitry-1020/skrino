@@ -8,6 +8,11 @@
 //! reshapes into a borderless, always-on-top fullscreen surface on entry and
 //! restores on exit. Window reshaping is driven off state transitions, never
 //! per-frame, to avoid fighting the OS (the previous freeze).
+//!
+//! Skrino must never photograph or record itself: every capture-adjacent window
+//! mode is excluded from screen capture (see [`crate::capture_shield`]), and
+//! where that is unavailable the root window is hidden and the desktop given a
+//! moment to settle before the capture runs (see [`AppState::HidingForCapture`]).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -22,6 +27,7 @@ use skrino_capture::{MonitorInfo, VirtualScreenCapture};
 use skrino_core::render::{RenderOptions, render_document};
 use skrino_record::RegionPx;
 
+use crate::capture_shield;
 use crate::config::{AppConfig, ImageFormat, ShareDestination};
 use crate::editor::{EditorSignal, EditorState};
 use crate::overlay::{OverlayOutcome, OverlayPurpose, OverlayState};
@@ -46,6 +52,11 @@ const HERO_WIDTH: f32 = 100.0;
 /// Hard cap on how long a window-close waits for an in-flight share to finish
 /// before the process exits anyway (see [`SkrinoApp::handle_close_request`]).
 const SHARE_CLOSE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long the desktop is given to repaint after the root window is hidden,
+/// before a capture runs. Only ever paid on systems where capture exclusion is
+/// unavailable (see [`SkrinoApp::start_capture_job`]); everywhere else the
+/// window is excluded from the capture and no wait happens at all.
+const HIDE_SETTLE: Duration = Duration::from_millis(160);
 
 /// How the UI process was launched. Each mode is one-shot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +79,28 @@ pub enum LaunchMode {
     OverlaySmoke,
 }
 
+/// A job that begins by photographing the desktop, so Skrino's own window must
+/// be out of the way first (see [`SkrinoApp::start_capture_job`]).
+#[derive(Clone, Copy)]
+enum CaptureJob {
+    /// Freeze the desktop and open the selection overlay. `smoke` auto-cancels.
+    Region { smoke: bool },
+    /// Straight to the editor with the whole virtual screen.
+    Full,
+    /// Selection overlay, then record the chosen area.
+    RecordRegion,
+    /// Record the monitor under the cursor, no overlay.
+    RecordFull,
+}
+
 /// Current UI state.
 enum AppState {
     /// First frame not yet dispatched.
     Boot,
+    /// Root window hidden, waiting for the desktop to repaint before running
+    /// `job`. Fallback path only: used when the window can't be excluded from
+    /// screen capture outright (see [`crate::capture_shield`]).
+    HidingForCapture { job: CaptureJob, ready_at: Instant },
     /// Small launcher window.
     Start,
     /// Region-selection overlay drawn into the (reshaped) root viewport.
@@ -107,6 +136,15 @@ enum WindowMode {
     ControlBar { pos: Pos2, size: Vec2 },
 }
 
+impl WindowMode {
+    /// Whether this window must be invisible to screen capture. Everything that
+    /// surrounds a capture is excluded; the editor and the settings screen are
+    /// ordinary windows the user may legitimately want in a screen share.
+    fn excluded_from_capture(&self) -> bool {
+        !matches!(self, WindowMode::Editor | WindowMode::Settings)
+    }
+}
+
 pub struct SkrinoApp {
     config: AppConfig,
     launch: LaunchMode,
@@ -137,6 +175,10 @@ pub struct SkrinoApp {
     record_stop: Option<Arc<AtomicBool>>,
     /// In-flight upload of a finished recording (server share destination).
     record_share: Option<ShareHandle>,
+    /// Result of the last attempt to exclude the root window from screen
+    /// capture. `Some(false)` / `None` means captures must hide the window
+    /// instead (see [`SkrinoApp::start_capture_job`]).
+    capture_excluded: Option<bool>,
 }
 
 impl SkrinoApp {
@@ -163,6 +205,7 @@ impl SkrinoApp {
             record_lock: None,
             record_stop: None,
             record_share: None,
+            capture_excluded: None,
         }
     }
 
@@ -191,11 +234,15 @@ impl SkrinoApp {
     fn dispatch_launch(&mut self, ctx: &egui::Context) {
         self.state = match self.launch {
             LaunchMode::Start => AppState::Start,
-            LaunchMode::CaptureRegion => self.begin_region_capture(false),
-            LaunchMode::OverlaySmoke => self.begin_region_capture(true),
-            LaunchMode::CaptureFull => self.begin_full_capture(),
-            LaunchMode::RecordRegion => self.begin_record_region(ctx),
-            LaunchMode::RecordFull => self.begin_record_full(ctx),
+            LaunchMode::CaptureRegion => {
+                self.start_capture_job(CaptureJob::Region { smoke: false }, ctx)
+            }
+            LaunchMode::OverlaySmoke => {
+                self.start_capture_job(CaptureJob::Region { smoke: true }, ctx)
+            }
+            LaunchMode::CaptureFull => self.start_capture_job(CaptureJob::Full, ctx),
+            LaunchMode::RecordRegion => self.start_capture_job(CaptureJob::RecordRegion, ctx),
+            LaunchMode::RecordFull => self.start_capture_job(CaptureJob::RecordFull, ctx),
             LaunchMode::OpenFile => self.begin_open_file(),
             LaunchMode::Settings => {
                 self.settings.open = true;
@@ -205,6 +252,35 @@ impl SkrinoApp {
     }
 
     // --- capture / open entry points ---
+
+    /// Begin a job that photographs the desktop, with Skrino itself out of the
+    /// frame. Normally the root window is already excluded from screen capture
+    /// and the job runs immediately; if the platform refused that exclusion the
+    /// window is hidden first and the job waits out [`HIDE_SETTLE`].
+    ///
+    /// One-shot launches (hotkey, tray) never reach the wait: their root window
+    /// is created invisible and is still hidden at dispatch time.
+    fn start_capture_job(&mut self, job: CaptureJob, ctx: &egui::Context) -> AppState {
+        let on_screen = self.is_interactive() && self.capture_excluded != Some(true);
+        if on_screen {
+            AppState::HidingForCapture {
+                job,
+                ready_at: Instant::now() + HIDE_SETTLE,
+            }
+        } else {
+            self.run_capture_job(job, ctx)
+        }
+    }
+
+    /// Run the job now — the window is already out of the capture.
+    fn run_capture_job(&mut self, job: CaptureJob, ctx: &egui::Context) -> AppState {
+        match job {
+            CaptureJob::Region { smoke } => self.begin_region_capture(smoke),
+            CaptureJob::Full => self.begin_full_capture(),
+            CaptureJob::RecordRegion => self.begin_record_region(ctx),
+            CaptureJob::RecordFull => self.begin_record_full(ctx),
+        }
+    }
 
     fn begin_region_capture(&mut self, smoke: bool) -> AppState {
         match catch_unwind(AssertUnwindSafe(skrino_capture::capture_virtual_screen)) {
@@ -812,7 +888,7 @@ impl SkrinoApp {
 
     fn window_mode_for_state(&self) -> WindowMode {
         match &self.state {
-            AppState::Boot => WindowMode::Hidden,
+            AppState::Boot | AppState::HidingForCapture { .. } => WindowMode::Hidden,
             AppState::Overlay(ov) => WindowMode::Overlay {
                 pos: ov.window_pos(),
                 size: ov.window_size(),
@@ -833,7 +909,18 @@ impl SkrinoApp {
         }
     }
 
-    fn apply_window_mode(&self, ctx: &egui::Context, mode: &WindowMode) {
+    fn apply_window_mode(&mut self, ctx: &egui::Context, frame: &eframe::Frame, mode: &WindowMode) {
+        // Keep Skrino's own chrome out of Skrino's own captures. Done here, on
+        // the same transition that reshapes the window, so the exclusion is in
+        // place before any state that can trigger a capture is ever drawn.
+        if let Some(window) = capture_shield::window_id(frame) {
+            let excluded = mode.excluded_from_capture();
+            let ok = capture_shield::set_excluded(window, excluded);
+            if excluded {
+                self.capture_excluded = Some(ok);
+            }
+        }
+
         let send = |c| ctx.send_viewport_cmd(c);
         match mode {
             WindowMode::Hidden => send(ViewportCommand::Visible(false)),
@@ -876,12 +963,21 @@ impl SkrinoApp {
 
     // --- main content dispatch ---
 
-    fn draw_main(&mut self, ctx: &egui::Context, frame: &eframe::Frame, palette: &Palette) {
+    fn draw_main(&mut self, ctx: &egui::Context, palette: &Palette) {
         let mut state = std::mem::replace(&mut self.state, AppState::Boot);
         let mut next: Option<AppState> = None;
 
         match &mut state {
             AppState::Boot => {}
+            AppState::HidingForCapture { job, ready_at } => {
+                let now = Instant::now();
+                if now >= *ready_at {
+                    let job = *job;
+                    next = Some(self.run_capture_job(job, ctx));
+                } else {
+                    ctx.request_repaint_after(*ready_at - now);
+                }
+            }
             AppState::SettingsOnly => {
                 // The standalone `--settings` process: the root window IS the
                 // settings screen, no separate Start content underneath.
@@ -902,11 +998,17 @@ impl SkrinoApp {
                 &self.config.hotkey,
                 self.hero_texture.as_ref(),
             ) {
-                StartSignal::Region => next = Some(self.begin_region_capture(false)),
-                StartSignal::Full => next = Some(self.begin_full_capture()),
+                StartSignal::Region => {
+                    next = Some(self.start_capture_job(CaptureJob::Region { smoke: false }, ctx))
+                }
+                StartSignal::Full => next = Some(self.start_capture_job(CaptureJob::Full, ctx)),
                 StartSignal::Open => next = Some(self.begin_open_file()),
-                StartSignal::RecordRegion => next = Some(self.begin_record_region(ctx)),
-                StartSignal::RecordFull => next = Some(self.begin_record_full(ctx)),
+                StartSignal::RecordRegion => {
+                    next = Some(self.start_capture_job(CaptureJob::RecordRegion, ctx))
+                }
+                StartSignal::RecordFull => {
+                    next = Some(self.start_capture_job(CaptureJob::RecordFull, ctx))
+                }
                 StartSignal::Settings => self.settings.open = true,
                 StartSignal::None => {}
             },
@@ -959,7 +1061,7 @@ impl SkrinoApp {
                     }
                 }
             }
-            AppState::Recording(sess) => match sess.ui(ctx, frame, palette) {
+            AppState::Recording(sess) => match sess.ui(ctx, palette) {
                 RecordSignal::None => {}
                 RecordSignal::Stop => self.finalize_recording(sess, ctx),
                 RecordSignal::Cancel => {
@@ -1054,11 +1156,11 @@ impl eframe::App for SkrinoApp {
         // Reshape the root window only on state transitions.
         let wanted = self.window_mode_for_state();
         if self.applied_window.as_ref() != Some(&wanted) {
-            self.apply_window_mode(ctx, &wanted);
+            self.apply_window_mode(ctx, frame, &wanted);
             self.applied_window = Some(wanted);
         }
 
-        self.draw_main(ctx, frame, &palette);
+        self.draw_main(ctx, &palette);
 
         // Settings-only launch exits when its window closes.
         if matches!(self.launch, LaunchMode::Settings) && !self.settings.open {

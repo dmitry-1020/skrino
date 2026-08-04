@@ -12,10 +12,10 @@
 //! -----------------
 //! The translucent selection overlay must never end up in the video, so the
 //! recorder is started only after an "arming" delay: the root window has by then
-//! shrunk from the fullscreen overlay to the tiny control bar, the control bar is
-//! excluded from capture via `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`,
-//! and the accent border frame (separate layered Win32 windows, also excluded)
-//! is up.
+//! shrunk from the fullscreen overlay to the tiny control bar, and the accent
+//! border frame (separate layered Win32 windows) is up. Both are excluded from
+//! capture — the control bar by `app.rs` when it applies the `ControlBar` window
+//! mode (see [`crate::capture_shield`]), the frame strips by `record_frame.rs`.
 //!
 //! IPC (mirrors the daemon's winapi plumbing)
 //! ------------------------------------------
@@ -81,8 +81,6 @@ pub struct RecordSession {
     opts: RecordOptions,
     /// Cross-thread stop request from the hotkey watcher.
     stop_flag: Arc<AtomicBool>,
-    /// Control-bar HWND excluded from capture yet.
-    affinity_set: bool,
     /// Precomputed control-bar window geometry (logical points).
     bar_pos: Pos2,
 }
@@ -121,7 +119,6 @@ impl RecordSession {
             frame_windows: None,
             opts,
             stop_flag,
-            affinity_set: false,
             bar_pos,
         }
     }
@@ -146,22 +143,8 @@ impl RecordSession {
         self.phase = Phase::Finalizing;
     }
 
-    /// Draw the control bar and advance the lifecycle. `frame` is needed to grab
-    /// the control-bar HWND for the capture-exclusion affinity.
-    pub fn ui(
-        &mut self,
-        ctx: &egui::Context,
-        frame: &eframe::Frame,
-        palette: &Palette,
-    ) -> RecordSignal {
-        // Keep the window out of the capture as soon as its HWND is real.
-        if !self.affinity_set
-            && let Some(hwnd) = control_bar_hwnd(frame)
-        {
-            exclude_from_capture(hwnd);
-            self.affinity_set = true;
-        }
-
+    /// Draw the control bar and advance the lifecycle.
+    pub fn ui(&mut self, ctx: &egui::Context, palette: &Palette) -> RecordSignal {
         match &mut self.phase {
             Phase::Arming { since, frames } => {
                 *frames += 1;
@@ -494,34 +477,6 @@ fn cursor_pos() -> Option<(i32, i32)> {
 fn cursor_pos() -> Option<(i32, i32)> {
     None
 }
-
-// --- control-bar HWND + capture exclusion ---
-
-#[cfg(windows)]
-fn control_bar_hwnd(frame: &eframe::Frame) -> Option<winapi::shared::windef::HWND> {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match frame.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(h) => Some(h.hwnd.get() as winapi::shared::windef::HWND),
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn exclude_from_capture(hwnd: winapi::shared::windef::HWND) {
-    // WDA_EXCLUDEFROMCAPTURE (winapi 0.3 lacks the constant).
-    const WDA_EXCLUDEFROMCAPTURE: winapi::shared::minwindef::UINT = 0x11;
-    unsafe {
-        winapi::um::winuser::SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-    }
-}
-
-#[cfg(not(windows))]
-fn control_bar_hwnd(_frame: &eframe::Frame) -> Option<()> {
-    None
-}
-
-#[cfg(not(windows))]
-fn exclude_from_capture(_hwnd: ()) {}
 
 // ============================ Stop-toggle IPC ============================
 

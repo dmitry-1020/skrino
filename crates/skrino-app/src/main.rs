@@ -11,6 +11,7 @@
 
 mod app;
 mod autostart;
+mod capture_shield;
 mod config;
 mod daemon;
 mod editor;
