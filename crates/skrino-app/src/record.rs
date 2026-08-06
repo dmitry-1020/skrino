@@ -35,13 +35,26 @@ use egui::{CornerRadius, FontId, Pos2, Sense, Vec2, ViewportCommand};
 use egui_phosphor::regular as ph;
 use skrino_record::{RecordOptions, Recorder, RegionPx};
 
+use crate::capture_shield::WindowId;
 use crate::record_frame::BorderFrame;
 use crate::theme::Palette;
 
-/// Control-bar size in logical points.
-const BAR_SIZE: Vec2 = Vec2::new(224.0, 48.0);
+/// Control-bar size in logical points. Slightly wider than the original 224 to
+/// fit the stop-hotkey hint under the timer, and a touch taller for that second
+/// line; kept a fixed constant so `window_size`/placement math stay in sync.
+const BAR_SIZE: Vec2 = Vec2::new(296.0, 52.0);
 /// Gap (logical points) between the recorded region and the control bar.
 const BAR_GAP: f32 = 8.0;
+/// Layered-window translucency on the glow control-bar window. The bar is an
+/// OpenGL (glow) window, so uniform `LWA_ALPHA` (whole-window alpha) is used;
+/// it composes correctly regardless of per-pixel rendering and coexists with the
+/// window's `WDA_EXCLUDEFROMCAPTURE` affinity (display affinity and extended
+/// window styles are independent). The idle alpha is kept intentionally high so
+/// the bar stays clearly legible even if a GPU renders the layered GL surface
+/// imperfectly.
+const BAR_ALPHA_IDLE: u8 = 215;
+/// Fully opaque while the pointer is over the bar.
+const BAR_ALPHA_HOVER: u8 = 255;
 /// Minimum time the window is given to shrink from the overlay before capture
 /// begins, so the fullscreen overlay is never caught in the first frames.
 const ARM_DELAY: Duration = Duration::from_millis(180);
@@ -83,13 +96,21 @@ pub struct RecordSession {
     stop_flag: Arc<AtomicBool>,
     /// Precomputed control-bar window geometry (logical points).
     bar_pos: Pos2,
+    /// Stop-hotkey label shown as a hint in the Active view (e.g. "Ctrl+Shift+6").
+    stop_hotkey: String,
+    /// Whether the pointer was over the bar last frame. Drives the layered-window
+    /// alpha: the alpha is pushed to Win32 only when this flips, never per-frame.
+    hover: bool,
+    /// Whether `WS_EX_LAYERED` has been applied and the initial alpha pushed.
+    layered_ready: bool,
 }
 
 impl RecordSession {
     /// Build a session. `region` is the capture area in virtual-screen physical
     /// pixels (`None` = primary monitor); `scale` the monitor DPI scale;
     /// `audio` the single audio source (if any) to record; `output` the temp
-    /// .mp4 path; `stop_flag` shared with the hotkey watcher.
+    /// .mp4 path; `stop_hotkey` the label of the hotkey that also stops the
+    /// recording (shown as a hint); `stop_flag` shared with the hotkey watcher.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         region: Option<RegionPx>,
@@ -98,6 +119,7 @@ impl RecordSession {
         capture_cursor: bool,
         audio: skrino_record::AudioSource,
         output: PathBuf,
+        stop_hotkey: String,
         stop_flag: Arc<AtomicBool>,
     ) -> Self {
         let scale = if scale > 0.0 { scale } else { 1.0 };
@@ -120,6 +142,9 @@ impl RecordSession {
             opts,
             stop_flag,
             bar_pos,
+            stop_hotkey,
+            hover: false,
+            layered_ready: false,
         }
     }
 
@@ -143,8 +168,20 @@ impl RecordSession {
         self.phase = Phase::Finalizing;
     }
 
-    /// Draw the control bar and advance the lifecycle.
-    pub fn ui(&mut self, ctx: &egui::Context, palette: &Palette) -> RecordSignal {
+    /// Draw the control bar and advance the lifecycle. `bar_hwnd` is the root
+    /// (control-bar) window handle, used to drive the layered-window translucency
+    /// on hover changes.
+    pub fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        palette: &Palette,
+        bar_hwnd: Option<WindowId>,
+    ) -> RecordSignal {
+        // Hover = pointer over the bar (the whole window IS the bar). Detected via
+        // egui, not Win32. The alpha is only pushed to Win32 when it flips.
+        let hovered = ctx.input(|i| i.pointer.hover_pos()).is_some();
+        self.update_bar_alpha(bar_hwnd, hovered);
+
         match &mut self.phase {
             Phase::Arming { since, frames } => {
                 *frames += 1;
@@ -178,6 +215,30 @@ impl RecordSession {
         }
     }
 
+    /// Keep the layered-window alpha in step with hover. Adds `WS_EX_LAYERED`
+    /// once (and pushes the initial alpha), then pushes a new alpha ONLY when the
+    /// hover state changes, never every frame.
+    fn update_bar_alpha(&mut self, bar_hwnd: Option<WindowId>, hovered: bool) {
+        #[cfg(windows)]
+        if let Some(hwnd) = bar_hwnd {
+            if !self.layered_ready {
+                ensure_layered(hwnd);
+                self.layered_ready = true;
+                self.hover = hovered;
+                set_bar_alpha(hwnd, alpha_for(hovered));
+                return;
+            }
+            if hovered != self.hover {
+                self.hover = hovered;
+                set_bar_alpha(hwnd, alpha_for(hovered));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (bar_hwnd, hovered);
+        }
+    }
+
     /// Bring up the border frame and start the recorder (end of arming).
     fn begin_capture(&mut self) -> RecordSignal {
         if let Some(region) = self.region {
@@ -201,7 +262,7 @@ impl RecordSession {
                 egui::Frame::new()
                     .fill(palette.panel)
                     .corner_radius(CornerRadius::same(12))
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
                 // Dragging the pill background moves the window (transition-only
@@ -262,12 +323,23 @@ impl RecordSession {
         ui.painter()
             .circle_filled(dot_rect.center(), 5.0, dot_color);
 
-        // Timer mm:ss.
-        ui.label(
-            egui::RichText::new(format_elapsed(elapsed))
-                .font(FontId::monospace(15.0))
-                .color(palette.text),
-        );
+        // Timer mm:ss, with the stop-hotkey hint tucked underneath (discoverable
+        // backstop: pressing the record hotkey again also stops the recording).
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(
+                egui::RichText::new(format_elapsed(elapsed))
+                    .font(FontId::monospace(15.0))
+                    .color(palette.text),
+            );
+            if !self.stop_hotkey.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("стоп: {}", self.stop_hotkey))
+                        .size(9.5)
+                        .color(palette.text_secondary),
+                );
+            }
+        });
 
         ui.add_space(2.0);
 
@@ -328,61 +400,186 @@ fn format_elapsed(d: Duration) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-/// Compute the control-bar outer position (logical points): just below the
-/// region's bottom edge, else tucked into the region's top-right corner if there
-/// is no room below, clamped to the containing monitor's work area.
-fn control_bar_pos(region: Option<RegionPx>, scale: f32) -> Pos2 {
-    let Some(region) = region else {
-        // Full-primary recording with no explicit region: a modest default.
-        return Pos2::new(40.0, 40.0);
-    };
-    let left = region.x as f32 / scale;
-    let top = region.y as f32 / scale;
-    let right = (region.x + region.width as i32) as f32 / scale;
-    let bottom = (region.y + region.height as i32) as f32 / scale;
+/// Plain monitor geometry (physical pixels) fed to the placement math, so the
+/// geometry is unit-testable without a real desktop. `w`/`h` are the full monitor
+/// bounds; `wx`/`wy`/`ww`/`wh` are the work area (taskbar excluded).
+#[derive(Clone, Copy)]
+struct MonGeom {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+    scale: f32,
+    is_primary: bool,
+}
 
-    let (mon_left, mon_top, mon_right, mon_bottom) = monitor_bounds_pt(region, scale);
-
-    // Preferred: just below the region, left-aligned.
-    let mut pos = Pos2::new(left, bottom + BAR_GAP);
-    // No room below -> inside the region's top-right corner.
-    if pos.y + BAR_SIZE.y > mon_bottom {
-        pos = Pos2::new(right - BAR_SIZE.x - BAR_GAP, top + BAR_GAP);
+impl MonGeom {
+    fn scale(&self) -> f32 {
+        if self.scale > 0.0 { self.scale } else { 1.0 }
     }
-    // Clamp to the monitor's work area.
-    pos.x = pos.x.clamp(mon_left, (mon_right - BAR_SIZE.x).max(mon_left));
-    pos.y = pos.y.clamp(mon_top, (mon_bottom - BAR_SIZE.y).max(mon_top));
+
+    /// Work-area edges in logical points.
+    fn work_pt(&self) -> (f32, f32, f32, f32) {
+        let s = self.scale();
+        (
+            self.wx as f32 / s,
+            self.wy as f32 / s,
+            (self.wx + self.ww) as f32 / s,
+            (self.wy + self.wh) as f32 / s,
+        )
+    }
+
+    fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+
+    fn same_as(&self, other: &MonGeom) -> bool {
+        self.x == other.x && self.y == other.y && self.w == other.w && self.h == other.h
+    }
+}
+
+/// Compute the control-bar outer position (logical points). Region recordings
+/// keep the bar just below the region when there is room on that region's own
+/// monitor; otherwise (full-screen, or a region hugging the bottom) the bar docks
+/// off the recorded content: onto a second monitor's work area if one exists,
+/// else onto the bottom-centre of the recorded monitor's own work area. Always
+/// clamped to the chosen monitor's work area so it can never go off-screen.
+fn control_bar_pos(region: Option<RegionPx>, scale: f32) -> Pos2 {
+    control_bar_pos_geom(region, &gather_monitor_geom(scale))
+}
+
+/// Pure placement math (see [`control_bar_pos`]); split out so it can be tested
+/// with injected monitor data.
+fn control_bar_pos_geom(region: Option<RegionPx>, monitors: &[MonGeom]) -> Pos2 {
+    // No monitor data at all (enumeration failed / headless): best-effort.
+    if monitors.is_empty() {
+        return match region {
+            Some(r) => Pos2::new(r.x as f32, (r.y + r.height as i32) as f32 + BAR_GAP),
+            None => Pos2::new(40.0, 40.0),
+        };
+    }
+
+    // The recorded monitor: the one under the region's centre; for a full-screen
+    // (`region == None`) recording, the primary monitor.
+    let recorded = region
+        .and_then(|r| {
+            let cx = r.x + r.width as i32 / 2;
+            let cy = r.y + r.height as i32 / 2;
+            monitors.iter().find(|m| m.contains(cx, cy))
+        })
+        .or_else(|| monitors.iter().find(|m| m.is_primary))
+        .or_else(|| monitors.first())
+        .copied()
+        .expect("monitors is non-empty");
+
+    // Region recording with room below on its own monitor's work area: the
+    // well-liked default, just below the region and left-aligned.
+    if let Some(r) = region {
+        let s = recorded.scale();
+        let region_bottom = (r.y + r.height as i32) as f32 / s;
+        let (_, _, _, work_bottom) = recorded.work_pt();
+        if region_bottom + BAR_GAP + BAR_SIZE.y <= work_bottom {
+            let mut pos = Pos2::new(r.x as f32 / s, region_bottom + BAR_GAP);
+            clamp_to_work(&mut pos, &recorded);
+            return pos;
+        }
+    }
+
+    // Otherwise dock off the recorded content: a second monitor if present, else
+    // the bottom-centre of the recorded monitor's own work area.
+    let host = monitors
+        .iter()
+        .find(|m| !m.same_as(&recorded))
+        .copied()
+        .unwrap_or(recorded);
+
+    let mut pos = bottom_center(&host);
+    clamp_to_work(&mut pos, &host);
     pos
 }
 
-/// The bounds (logical points) of the monitor containing `region`'s centre,
-/// falling back to the region's own rect when monitors can't be enumerated.
-fn monitor_bounds_pt(region: RegionPx, scale: f32) -> (f32, f32, f32, f32) {
-    let cx = region.x + region.width as i32 / 2;
-    let cy = region.y + region.height as i32 / 2;
-    if let Ok(monitors) = skrino_capture::list_monitors()
-        && let Some(m) = monitors.iter().find(|m| {
-            cx >= m.x && cx < m.x + m.width as i32 && cy >= m.y && cy < m.y + m.height as i32
+/// Bottom-centre of a monitor's work area (just above the taskbar), in points.
+fn bottom_center(m: &MonGeom) -> Pos2 {
+    let (wl, _, wr, wb) = m.work_pt();
+    let x = wl + ((wr - wl) - BAR_SIZE.x) / 2.0;
+    let y = wb - BAR_SIZE.y - BAR_GAP;
+    Pos2::new(x, y)
+}
+
+/// Clamp a position so the whole bar stays inside `m`'s work area.
+fn clamp_to_work(pos: &mut Pos2, m: &MonGeom) {
+    let (wl, wt, wr, wb) = m.work_pt();
+    pos.x = pos.x.clamp(wl, (wr - BAR_SIZE.x).max(wl));
+    pos.y = pos.y.clamp(wt, (wb - BAR_SIZE.y).max(wt));
+}
+
+/// Enumerate monitors with their Win32 work areas (physical pixels). Empty when
+/// enumeration fails (headless / non-Windows), which the caller handles.
+#[cfg(windows)]
+fn gather_monitor_geom(fallback_scale: f32) -> Vec<MonGeom> {
+    let Ok(monitors) = skrino_capture::list_monitors() else {
+        return Vec::new();
+    };
+    monitors
+        .into_iter()
+        .map(|m| {
+            let full = (m.x, m.y, m.width as i32, m.height as i32);
+            let (wx, wy, ww, wh) = work_area_px(m.x, m.y, m.width as i32, m.height as i32)
+                .unwrap_or(full);
+            MonGeom {
+                x: m.x,
+                y: m.y,
+                w: m.width as i32,
+                h: m.height as i32,
+                wx,
+                wy,
+                ww,
+                wh,
+                scale: if m.scale_factor > 0.0 {
+                    m.scale_factor
+                } else {
+                    fallback_scale
+                },
+                is_primary: m.is_primary,
+            }
         })
-    {
-        let s = if m.scale_factor > 0.0 {
-            m.scale_factor
-        } else {
-            scale
-        };
-        return (
-            m.x as f32 / s,
-            m.y as f32 / s,
-            (m.x + m.width as i32) as f32 / s,
-            (m.y + m.height as i32) as f32 / s,
-        );
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn gather_monitor_geom(_fallback_scale: f32) -> Vec<MonGeom> {
+    Vec::new()
+}
+
+/// The work area (taskbar excluded) of the monitor containing the centre of the
+/// given physical-pixel rect, via `GetMonitorInfoW`'s `rcWork`.
+#[cfg(windows)]
+fn work_area_px(x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::{
+        GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONULL, MonitorFromPoint,
+    };
+    let pt = POINT {
+        x: x + w / 2,
+        y: y + h / 2,
+    };
+    unsafe {
+        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+        if hmon.is_null() {
+            return None;
+        }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut mi) == 0 {
+            return None;
+        }
+        let r = mi.rcWork;
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
     }
-    (
-        region.x as f32 / scale,
-        region.y as f32 / scale,
-        (region.x + region.width as i32) as f32 / scale,
-        (region.y + region.height as i32) as f32 / scale,
-    )
 }
 
 /// Build the temp .mp4 path the engine writes before the file is moved/uploaded.
@@ -456,6 +653,40 @@ pub fn run_smoke() -> ! {
             eprintln!("{e}");
             std::process::exit(1);
         }
+    }
+}
+
+// --- layered-window translucency helpers ---
+
+/// The layered alpha for a given hover state.
+#[cfg(windows)]
+fn alpha_for(hovered: bool) -> u8 {
+    if hovered {
+        BAR_ALPHA_HOVER
+    } else {
+        BAR_ALPHA_IDLE
+    }
+}
+
+/// Add `WS_EX_LAYERED` to the bar window's extended style once (OR-ed in, so it
+/// never disturbs the existing ex-styles or the capture affinity).
+#[cfg(windows)]
+fn ensure_layered(hwnd: WindowId) {
+    use winapi::um::winuser::{GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_LAYERED};
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED as isize == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+        }
+    }
+}
+
+/// Push a whole-window alpha via `LWA_ALPHA` (glow-window friendly).
+#[cfg(windows)]
+fn set_bar_alpha(hwnd: WindowId, alpha: u8) {
+    use winapi::um::winuser::{LWA_ALPHA, SetLayeredWindowAttributes};
+    unsafe {
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
     }
 }
 
@@ -639,26 +870,120 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(600)), "10:00");
     }
 
+    /// A single 1920x1080 primary monitor with a 40px bottom taskbar.
+    fn primary_1080() -> MonGeom {
+        MonGeom {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            wx: 0,
+            wy: 0,
+            ww: 1920,
+            wh: 1040,
+            scale: 1.0,
+            is_primary: true,
+        }
+    }
+
+    /// A second 1920x1080 monitor to the right, no taskbar (full work area).
+    fn secondary_right() -> MonGeom {
+        MonGeom {
+            x: 1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            wx: 1920,
+            wy: 0,
+            ww: 1920,
+            wh: 1080,
+            scale: 1.0,
+            is_primary: false,
+        }
+    }
+
     #[test]
-    fn control_bar_pos_below_region_when_room() {
-        // A small region high on a large-ish virtual screen: the bar sits just
-        // below the region's bottom edge (scale 1.0 -> points == pixels).
+    fn below_region_when_room() {
+        // A small region high on the monitor: the bar sits just below it.
         let region = RegionPx {
             x: 100,
             y: 100,
             width: 400,
             height: 200,
         };
-        let pos = control_bar_pos(Some(region), 1.0);
-        // Just below the bottom edge (y = 300 + gap), left-aligned at x = 100,
-        // unless clamped by the monitor bounds fallback (region rect). Since the
-        // fallback bounds equal the region, clamping pins x within [100, 100].
-        assert!(pos.y >= 100.0);
+        let pos = control_bar_pos_geom(Some(region), &[primary_1080()]);
+        assert_eq!(pos.x, 100.0);
+        assert_eq!(pos.y, 300.0 + BAR_GAP);
     }
 
     #[test]
-    fn full_region_uses_default_bar_pos() {
-        let pos = control_bar_pos(None, 1.0);
-        assert_eq!(pos, Pos2::new(40.0, 40.0));
+    fn below_region_kept_even_with_second_monitor() {
+        // Room below on the region's own monitor wins over moving to monitor 2.
+        let region = RegionPx {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 200,
+        };
+        let pos = control_bar_pos_geom(Some(region), &[primary_1080(), secondary_right()]);
+        assert_eq!(pos.x, 100.0);
+        assert_eq!(pos.y, 300.0 + BAR_GAP);
+    }
+
+    #[test]
+    fn full_screen_single_monitor_docks_bottom_center() {
+        // Full-screen (no region), single monitor: bottom-centre of work area,
+        // clear of the taskbar.
+        let pos = control_bar_pos_geom(None, &[primary_1080()]);
+        assert_eq!(pos.x, (1920.0 - BAR_SIZE.x) / 2.0);
+        assert_eq!(pos.y, 1040.0 - BAR_SIZE.y - BAR_GAP);
+        // Wholly inside the work area (above the taskbar at y=1040).
+        assert!(pos.y + BAR_SIZE.y <= 1040.0);
+    }
+
+    #[test]
+    fn region_hugging_bottom_docks_bottom_center() {
+        // A region whose bottom reaches the taskbar leaves no room below, so on a
+        // single monitor the bar docks to the bottom-centre of the work area.
+        let region = RegionPx {
+            x: 100,
+            y: 1000,
+            width: 400,
+            height: 40,
+        };
+        let pos = control_bar_pos_geom(Some(region), &[primary_1080()]);
+        assert_eq!(pos.x, (1920.0 - BAR_SIZE.x) / 2.0);
+        assert_eq!(pos.y, 1040.0 - BAR_SIZE.y - BAR_GAP);
+    }
+
+    #[test]
+    fn full_screen_moves_to_second_monitor() {
+        // Full-screen region on the primary: with a second monitor present the
+        // bar lands entirely on that other monitor's work area.
+        let region = RegionPx {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let pos = control_bar_pos_geom(Some(region), &[primary_1080(), secondary_right()]);
+        // Bottom-centre of the second monitor, off the recorded (primary) screen.
+        assert!(pos.x >= 1920.0, "bar should be on the second monitor");
+        assert_eq!(pos.x, 1920.0 + (1920.0 - BAR_SIZE.x) / 2.0);
+        assert_eq!(pos.y, 1080.0 - BAR_SIZE.y - BAR_GAP);
+    }
+
+    #[test]
+    fn no_monitor_data_falls_back() {
+        // Region: below the region; full-screen: the modest default corner.
+        let region = RegionPx {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 200,
+        };
+        let pos = control_bar_pos_geom(Some(region), &[]);
+        assert_eq!(pos, Pos2::new(100.0, 300.0 + BAR_GAP));
+        assert_eq!(control_bar_pos_geom(None, &[]), Pos2::new(40.0, 40.0));
     }
 }

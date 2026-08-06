@@ -395,11 +395,19 @@ impl SkrinoApp {
             return state;
         }
         let (region, scale) = record::full_monitor_region();
-        AppState::Recording(Box::new(self.new_record_session(region, scale)))
+        let stop_hotkey = self.config.hotkey_record_full.clone();
+        AppState::Recording(Box::new(self.new_record_session(region, scale, stop_hotkey)))
     }
 
-    /// Build a recording session from the shared config options.
-    fn new_record_session(&self, region: Option<RegionPx>, scale: f32) -> RecordSession {
+    /// Build a recording session from the shared config options. `stop_hotkey` is
+    /// the label of the hotkey that also stops this recording (region vs full),
+    /// shown as a hint in the control bar.
+    fn new_record_session(
+        &self,
+        region: Option<RegionPx>,
+        scale: f32,
+        stop_hotkey: String,
+    ) -> RecordSession {
         let stop_flag = self
             .record_stop
             .clone()
@@ -411,13 +419,15 @@ impl SkrinoApp {
             self.config.record_cursor,
             self.config.record_audio.to_record(),
             record::temp_output_path(),
+            stop_hotkey,
             stop_flag,
         )
     }
 
     /// Overlay confirmed a record region: start the session on that area.
     fn begin_recording(&mut self, region: RegionPx, scale: f32) -> AppState {
-        AppState::Recording(Box::new(self.new_record_session(Some(region), scale)))
+        let stop_hotkey = self.config.hotkey_record.clone();
+        AppState::Recording(Box::new(self.new_record_session(Some(region), scale, stop_hotkey)))
     }
 
     /// Whether the hotkey watcher has requested a stop (non-consuming peek).
@@ -963,7 +973,7 @@ impl SkrinoApp {
 
     // --- main content dispatch ---
 
-    fn draw_main(&mut self, ctx: &egui::Context, palette: &Palette) {
+    fn draw_main(&mut self, ctx: &egui::Context, frame: &eframe::Frame, palette: &Palette) {
         let mut state = std::mem::replace(&mut self.state, AppState::Boot);
         let mut next: Option<AppState> = None;
 
@@ -1061,7 +1071,8 @@ impl SkrinoApp {
                     }
                 }
             }
-            AppState::Recording(sess) => match sess.ui(ctx, palette) {
+            AppState::Recording(sess) => match sess.ui(ctx, palette, capture_shield::window_id(frame))
+            {
                 RecordSignal::None => {}
                 RecordSignal::Stop => self.finalize_recording(sess, ctx),
                 RecordSignal::Cancel => {
@@ -1160,7 +1171,7 @@ impl eframe::App for SkrinoApp {
             self.applied_window = Some(wanted);
         }
 
-        self.draw_main(ctx, &palette);
+        self.draw_main(ctx, frame, &palette);
 
         // Settings-only launch exits when its window closes.
         if matches!(self.launch, LaunchMode::Settings) && !self.settings.open {
