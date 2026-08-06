@@ -47,6 +47,7 @@ use windows_capture::settings::{
 use super::audio_dsp::{DST_SAMPLE_RATE, StereoResampler};
 use super::audio_wasapi::{AudioCapturer, AudioSel};
 use super::clock::RecordClock;
+use super::faststart;
 use super::flip;
 use super::geometry::{self, CropPlan, Rect};
 use super::pacing::FramePacer;
@@ -676,6 +677,13 @@ impl RecorderImpl {
         if let Some(msg) = self.shared.error.lock().unwrap().take() {
             return Err(RecordError::Encoder(msg));
         }
+
+        // The MF sink writes moov after mdat, which streaming players (Telegram
+        // inline preview) cannot start until fully downloaded. Rewrite the file
+        // to faststart (moov before mdat) now that it is fully flushed. This is
+        // best effort: on any failure the original playable file is left intact.
+        faststart::make_faststart(&self.output);
+
         Ok(self.output.clone())
     }
 
@@ -735,6 +743,37 @@ fn monitor_rect(monitor: &Monitor) -> Result<(Rect, bool), RecordError> {
 mod tests {
     use super::*;
 
+    /// Return the ordered top-level box types of an mp4 file, parsing headers
+    /// only (own parser, no ffmpeg). Handles 32-bit size, 64-bit largesize
+    /// (size==1), and size==0 (to end of file).
+    fn top_level_box_order(path: &std::path::Path) -> Vec<[u8; 4]> {
+        let data = std::fs::read(path).expect("read mp4");
+        let len = data.len() as u64;
+        let mut order = Vec::new();
+        let mut off = 0u64;
+        while off + 8 <= len {
+            let o = off as usize;
+            let size32 = u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as u64;
+            let box_type = [data[o + 4], data[o + 5], data[o + 6], data[o + 7]];
+            let total = if size32 == 1 {
+                if off + 16 > len {
+                    break;
+                }
+                u64::from_be_bytes(data[o + 8..o + 16].try_into().unwrap())
+            } else if size32 == 0 {
+                len - off
+            } else {
+                size32
+            };
+            if total < 8 || off + total > len {
+                break;
+            }
+            order.push(box_type);
+            off += total;
+        }
+        order
+    }
+
     #[test]
     fn is_supported_is_true_on_this_windows() {
         // The dev/CI box is Windows 11, so WGC must be available.
@@ -787,11 +826,29 @@ mod tests {
             meta.len()
         );
 
+        // The faststart post-process must have moved moov before mdat so the
+        // file streams inline (Telegram etc.).
+        let order = top_level_box_order(&output);
+        let moov_pos = order.iter().position(|t| t == b"moov");
+        let mdat_pos = order.iter().position(|t| t == b"mdat");
+        assert!(
+            moov_pos.is_some() && mdat_pos.is_some() && moov_pos < mdat_pos,
+            "expected faststart layout (moov before mdat), got {:?}",
+            order
+                .iter()
+                .map(|t| String::from_utf8_lossy(t).into_owned())
+                .collect::<Vec<_>>()
+        );
+
         eprintln!(
-            "recorded {} bytes to {} (active elapsed {:?})",
+            "recorded {} bytes to {} (active elapsed {:?}), top-level order: {:?}",
             meta.len(),
             output.display(),
-            elapsed
+            elapsed,
+            order
+                .iter()
+                .map(|t| String::from_utf8_lossy(t).into_owned())
+                .collect::<Vec<_>>()
         );
         let _ = std::fs::remove_file(&output);
     }
