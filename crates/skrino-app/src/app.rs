@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use egui::{CornerRadius, Pos2, RichText, Sense, Stroke, Vec2, ViewportCommand, WindowLevel};
 use egui_phosphor::regular as ph;
 use image::RgbaImage;
-use skrino_capture::{MonitorInfo, VirtualScreenCapture};
+use skrino_capture::MonitorInfo;
 use skrino_core::render::{RenderOptions, render_document};
 use skrino_record::RegionPx;
 
@@ -283,8 +283,10 @@ impl SkrinoApp {
     }
 
     fn begin_region_capture(&mut self, smoke: bool) -> AppState {
-        match catch_unwind(AssertUnwindSafe(skrino_capture::capture_virtual_screen)) {
-            Ok(Ok(cap)) => match build_overlay(cap, OverlayPurpose::Screenshot, smoke) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            skrino_capture::capture_monitor_at(cursor_pos())
+        })) {
+            Ok(Ok((monitor, image))) => match build_overlay(image, &monitor, OverlayPurpose::Screenshot, smoke) {
                 Some(ov) => AppState::Overlay(Box::new(ov)),
                 None => {
                     self.toasts.error("Не удалось подготовить область выделения");
@@ -304,7 +306,7 @@ impl SkrinoApp {
 
     fn begin_full_capture(&mut self) -> AppState {
         match catch_unwind(AssertUnwindSafe(skrino_capture::capture_virtual_screen)) {
-            Ok(Ok(cap)) => AppState::Editor(Box::new(EditorState::new(cap.image))),
+            Ok(Ok(cap)) => self.open_editor(cap.image),
             Ok(Err(e)) => {
                 self.toasts.error(format!("Не удалось сделать снимок: {e}"));
                 self.finish()
@@ -326,12 +328,17 @@ impl SkrinoApp {
             return self.finish();
         };
         match image::open(&path) {
-            Ok(img) => AppState::Editor(Box::new(EditorState::new(img.to_rgba8()))),
+            Ok(image::DynamicImage::ImageRgba8(rgba)) => self.open_editor(rgba),
+            Ok(img) => self.open_editor(img.to_rgba8()),
             Err(e) => {
                 self.toasts.error(format!("Не удалось открыть файл: {e}"));
                 self.finish()
             }
         }
+    }
+
+    fn open_editor(&self, image: RgbaImage) -> AppState {
+        AppState::Editor(Box::new(EditorState::new(image, self.config.editor)))
     }
 
     // --- recording entry points ---
@@ -366,8 +373,10 @@ impl SkrinoApp {
         if let Err(state) = self.arm_recording(ctx) {
             return state;
         }
-        match catch_unwind(AssertUnwindSafe(skrino_capture::capture_virtual_screen)) {
-            Ok(Ok(cap)) => match build_overlay(cap, OverlayPurpose::Record, false) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            skrino_capture::capture_monitor_at(cursor_pos())
+        })) {
+            Ok(Ok((monitor, image))) => match build_overlay(image, &monitor, OverlayPurpose::Record, false) {
                 Some(ov) => AppState::Overlay(Box::new(ov)),
                 None => {
                     crate::notify::notify(
@@ -618,7 +627,7 @@ impl SkrinoApp {
         let Some(img) = self.render(ed) else {
             return false;
         };
-        if let Err(e) = copy_image_to_clipboard(&img) {
+        if let Err(e) = copy_image_to_clipboard(img) {
             self.toasts.error(format!("Буфер обмена: {e}"));
             false
         } else {
@@ -756,7 +765,7 @@ impl SkrinoApp {
             return false;
         }
         // Copy the rendered image (not a link) to the clipboard.
-        let _ = copy_image_to_clipboard(&img);
+        let _ = copy_image_to_clipboard(img);
         crate::notify::notify(
             "Скриншот сохранён",
             path.display().to_string(),
@@ -1027,6 +1036,7 @@ impl SkrinoApp {
                 let signal = ed.ui(ctx, palette, sharing);
                 match signal {
                     EditorSignal::Close => {
+                        persist_editor_prefs(&mut self.config, ed);
                         // Escape closes the editor the same way the OS window
                         // X does; a one-shot process would otherwise exit
                         // immediately here and kill an in-flight upload on
@@ -1039,18 +1049,25 @@ impl SkrinoApp {
                         }
                     }
                     EditorSignal::Copy => {
+                        persist_editor_prefs(&mut self.config, ed);
                         // The image is in the clipboard: the job is done,
                         // close the editor (per user request).
                         if self.do_copy(ed) {
                             next = Some(self.finish());
                         }
                     }
-                    EditorSignal::Save => self.do_save(ed),
-                    EditorSignal::Share => match self.do_share(ed) {
-                        ShareOutcome::LocalDone => next = Some(self.finish()),
-                        ShareOutcome::ServerInFlight => self.close_after_share = true,
-                        ShareOutcome::Failed => {}
-                    },
+                    EditorSignal::Save => {
+                        persist_editor_prefs(&mut self.config, ed);
+                        self.do_save(ed);
+                    }
+                    EditorSignal::Share => {
+                        persist_editor_prefs(&mut self.config, ed);
+                        match self.do_share(ed) {
+                            ShareOutcome::LocalDone => next = Some(self.finish()),
+                            ShareOutcome::ServerInFlight => self.close_after_share = true,
+                            ShareOutcome::Failed => {}
+                        }
+                    }
                     EditorSignal::None => {}
                 }
             }
@@ -1061,7 +1078,7 @@ impl SkrinoApp {
                 } else {
                     match ov.run(ctx, palette) {
                         OverlayOutcome::Screenshot(img) => {
-                            next = Some(AppState::Editor(Box::new(EditorState::new(img))));
+                            next = Some(self.open_editor(img));
                         }
                         OverlayOutcome::Region(region) => {
                             next = Some(self.begin_recording(region, ov.scale()));
@@ -1115,6 +1132,9 @@ impl SkrinoApp {
     /// before actually exiting.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !self.pending_close && ctx.input(|i| i.viewport().close_requested()) {
+            if let AppState::Editor(ed) = &self.state {
+                persist_editor_prefs(&mut self.config, ed);
+            }
             if self.share.as_ref().is_some_and(|h| h.in_flight()) {
                 self.defer_close_for_share(ctx);
                 return;
@@ -1230,35 +1250,26 @@ fn windowed(ctx: &egui::Context, size: Vec2, title: &str) {
     ctx.send_viewport_cmd(ViewportCommand::Focus);
 }
 
-/// Build the overlay for the monitor under the cursor: crop that monitor's slice
-/// out of the virtual-screen capture and compute the root-window geometry. The
-/// same overlay serves screenshots and recordings; `purpose` decides what a
-/// confirmed selection becomes.
+/// Build the overlay for one already-captured monitor. `image` is that
+/// monitor's physical pixels; `monitor` supplies virtual-screen origin and DPI
+/// so a confirmed selection can be mapped back for recording.
 fn build_overlay(
-    cap: VirtualScreenCapture,
+    image: RgbaImage,
+    monitor: &MonitorInfo,
     purpose: OverlayPurpose,
     smoke: bool,
 ) -> Option<OverlayState> {
-    let cursor = cursor_pos();
-    let monitor = pick_monitor(&cap, cursor)?.clone();
-
     let scale = if monitor.scale_factor > 0.0 {
         monitor.scale_factor
     } else {
         1.0
     };
 
-    // Offset of the monitor within the stitched capture image (physical px).
-    let img_w = cap.image.width();
-    let img_h = cap.image.height();
-    let ox = (monitor.x - cap.origin_x).max(0) as u32;
-    let oy = (monitor.y - cap.origin_y).max(0) as u32;
-    let w = monitor.width.min(img_w.saturating_sub(ox));
-    let h = monitor.height.min(img_h.saturating_sub(oy));
+    let w = image.width();
+    let h = image.height();
     if w == 0 || h == 0 {
         return None;
     }
-    let slice = image::imageops::crop_imm(&cap.image, ox, oy, w, h).to_image();
 
     // Root-window geometry in logical points (physical / scale). egui multiplies
     // these by the window's pixels-per-point when applying the commands.
@@ -1266,7 +1277,7 @@ fn build_overlay(
     let size_pt = Vec2::new(w as f32 / scale, h as f32 / scale);
 
     Some(OverlayState::new(
-        slice, scale, pos_pt, size_pt, monitor.x, monitor.y, purpose, smoke,
+        image, scale, pos_pt, size_pt, monitor.x, monitor.y, purpose, smoke,
     ))
 }
 
@@ -1292,22 +1303,13 @@ fn move_into_dir(from: &Path, dir: &Path) -> Option<std::path::PathBuf> {
     move_file(from, &dest).ok().map(|()| dest)
 }
 
-/// Choose the monitor under the cursor, else the primary, else the first.
-fn pick_monitor(cap: &VirtualScreenCapture, cursor: Option<(i32, i32)>) -> Option<&MonitorInfo> {
-    if let Some((cx, cy)) = cursor
-        && let Some(m) = cap.monitors.iter().find(|m| {
-            cx >= m.x
-                && cx < m.x + m.width as i32
-                && cy >= m.y
-                && cy < m.y + m.height as i32
-        })
-    {
-        return Some(m);
+/// Write the editor's current tool/style into `config` and persist if it changed.
+fn persist_editor_prefs(config: &mut crate::config::AppConfig, ed: &EditorState) {
+    let prefs = ed.prefs();
+    if config.editor != prefs {
+        config.editor = prefs;
+        config.save();
     }
-    cap.monitors
-        .iter()
-        .find(|m| m.is_primary)
-        .or_else(|| cap.monitors.first())
 }
 
 /// Cursor position in physical virtual-screen coordinates.
@@ -1328,12 +1330,12 @@ fn cursor_pos() -> Option<(i32, i32)> {
     None
 }
 
-fn copy_image_to_clipboard(img: &RgbaImage) -> Result<(), String> {
+fn copy_image_to_clipboard(img: RgbaImage) -> Result<(), String> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let data = arboard::ImageData {
         width: w,
         height: h,
-        bytes: std::borrow::Cow::Owned(img.clone().into_raw()),
+        bytes: std::borrow::Cow::Owned(img.into_raw()),
     };
     arboard::Clipboard::new()
         .and_then(|mut cb| cb.set_image(data))
@@ -1525,7 +1527,14 @@ fn encode_image(img: &RgbaImage, format: ImageFormat, quality: u8) -> Result<Vec
             .write_to(&mut cursor, image::ImageFormat::Png)
             .map_err(|e| e.to_string())?,
         ImageFormat::Jpeg => {
-            let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+            let (w, h) = (img.width(), img.height());
+            let src = img.as_raw();
+            let mut rgb = vec![0u8; src.len() / 4 * 3];
+            for (dst, px) in rgb.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                dst.copy_from_slice(&px[..3]);
+            }
+            let rgb = image::RgbImage::from_raw(w, h, rgb)
+                .ok_or_else(|| "jpeg rgb conversion failed".to_string())?;
             let mut enc =
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality.clamp(1, 100));
             enc.encode_image(&rgb).map_err(|e| e.to_string())?;

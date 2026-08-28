@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use skrino_core::{ArrowHead, Color, Tool};
 use skrino_upload::Protocol;
 
 use crate::theme::Theme;
@@ -180,6 +181,92 @@ impl UploadSettings {
     }
 }
 
+/// Last-used editor tool and style. Restored when a new screenshot opens, so
+/// a one-shot UI process (hotkey) behaves like the previous session. Crop /
+/// Select / Blur are not persisted as the active tool — those are gestures,
+/// not the thing people reach for on the next shot.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorPrefs {
+    pub tool: Tool,
+    /// Stroke width in image pixels; matches the editor slider `2..=12`.
+    pub thickness: f32,
+    pub text_size: f32,
+    pub arrow_head: ArrowHead,
+    pub color: Color,
+    /// Last subtype of the "Фигуры" group (Rect / Ellipse / Line / Counter).
+    pub last_shape: Tool,
+    /// Last subtype of the "Маркер" group (Marker / Pen).
+    pub last_marker: Tool,
+}
+
+impl Default for EditorPrefs {
+    fn default() -> Self {
+        Self {
+            tool: Tool::Arrow,
+            thickness: 12.0,
+            text_size: 24.0,
+            arrow_head: ArrowHead::Tapered,
+            color: Color::rgb(0xE8, 0x48, 0x4D),
+            last_shape: Tool::Rect,
+            last_marker: Tool::Marker,
+        }
+    }
+}
+
+impl EditorPrefs {
+    pub fn is_drawing_tool(tool: Tool) -> bool {
+        matches!(
+            tool,
+            Tool::Arrow
+                | Tool::Text
+                | Tool::Rect
+                | Tool::Ellipse
+                | Tool::Line
+                | Tool::Counter
+                | Tool::Marker
+                | Tool::Pen
+        )
+    }
+
+    fn is_shape_tool(tool: Tool) -> bool {
+        matches!(
+            tool,
+            Tool::Rect | Tool::Ellipse | Tool::Line | Tool::Counter
+        )
+    }
+
+    fn is_marker_tool(tool: Tool) -> bool {
+        matches!(tool, Tool::Marker | Tool::Pen)
+    }
+
+    /// Clamp values that came from disk (hand-edits, older ranges, a
+    /// non-drawing tool accidentally saved).
+    pub fn sanitized(self) -> Self {
+        Self {
+            tool: if Self::is_drawing_tool(self.tool) {
+                self.tool
+            } else {
+                Tool::Arrow
+            },
+            thickness: self.thickness.clamp(2.0, 12.0),
+            text_size: self.text_size.clamp(14.0, 48.0),
+            arrow_head: self.arrow_head,
+            color: self.color,
+            last_shape: if Self::is_shape_tool(self.last_shape) {
+                self.last_shape
+            } else {
+                Tool::Rect
+            },
+            last_marker: if Self::is_marker_tool(self.last_marker) {
+                self.last_marker
+            } else {
+                Tool::Marker
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -234,6 +321,10 @@ pub struct AppConfig {
     /// results). In-app toasts are unaffected by this flag.
     #[serde(default = "default_true")]
     pub notifications: bool,
+    /// Last-used editor tool / thickness / colour. Added later; old configs
+    /// fall back to the tapered max-thickness arrow.
+    #[serde(default)]
+    pub editor: EditorPrefs,
 }
 
 /// `#[serde(default = "...")]` needs a named function; used for fields that
@@ -282,6 +373,7 @@ impl Default for AppConfig {
             share_dest: ShareDestination::default(),
             configured: false,
             notifications: true,
+            editor: EditorPrefs::default(),
         }
     }
 }
@@ -313,10 +405,15 @@ impl AppConfig {
             return Self::default();
         };
         match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                log::warn!("config parse failed ({e}); using defaults");
-                Self::default()
-            }),
+            Ok(text) => serde_json::from_str(&text)
+                .map(|mut cfg: Self| {
+                    cfg.editor = cfg.editor.sanitized();
+                    cfg
+                })
+                .unwrap_or_else(|e| {
+                    log::warn!("config parse failed ({e}); using defaults");
+                    Self::default()
+                }),
             Err(_) => Self::default(),
         }
     }
@@ -636,5 +733,65 @@ mod tests {
         assert!(!u.is_configured());
         u.url_template = "https://x/{filename}".into();
         assert!(u.is_configured());
+    }
+
+    #[test]
+    fn editor_prefs_default_is_tapered_max_arrow() {
+        let prefs = EditorPrefs::default();
+        assert_eq!(prefs.tool, Tool::Arrow);
+        assert_eq!(prefs.arrow_head, ArrowHead::Tapered);
+        assert_eq!(prefs.thickness, 12.0);
+        assert_eq!(prefs.last_shape, Tool::Rect);
+        assert_eq!(prefs.last_marker, Tool::Marker);
+    }
+
+    #[test]
+    fn old_config_without_editor_prefs_gets_defaults() {
+        let json = r#"{
+            "theme": "Light",
+            "hotkey": "PrintScreen",
+            "format": "Png",
+            "jpeg_quality": 90,
+            "autostart": false,
+            "configured": true
+        }"#;
+        let back: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(back.editor, EditorPrefs::default());
+    }
+
+    #[test]
+    fn editor_prefs_sanitized_clamps_tool_and_thickness() {
+        let dirty = EditorPrefs {
+            tool: Tool::Crop,
+            thickness: 99.0,
+            text_size: 3.0,
+            arrow_head: ArrowHead::Dashed,
+            color: Color::rgb(1, 2, 3),
+            last_shape: Tool::Select,
+            last_marker: Tool::Blur,
+        };
+        let clean = dirty.sanitized();
+        assert_eq!(clean.tool, Tool::Arrow);
+        assert_eq!(clean.thickness, 12.0);
+        assert_eq!(clean.text_size, 14.0);
+        assert_eq!(clean.arrow_head, ArrowHead::Dashed);
+        assert_eq!(clean.last_shape, Tool::Rect);
+        assert_eq!(clean.last_marker, Tool::Marker);
+    }
+
+    #[test]
+    fn editor_prefs_round_trip_through_json() {
+        let prefs = EditorPrefs {
+            tool: Tool::Pen,
+            thickness: 8.0,
+            text_size: 32.0,
+            arrow_head: ArrowHead::Dashed,
+            color: Color::rgb(0x35, 0x74, 0xF0),
+            last_shape: Tool::Ellipse,
+            last_marker: Tool::Pen,
+        };
+        let text = serde_json::to_string(&prefs).unwrap();
+        let back: EditorPrefs = serde_json::from_str(&text).unwrap();
+        assert_eq!(prefs, back);
     }
 }

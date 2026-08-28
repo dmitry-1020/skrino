@@ -173,53 +173,80 @@ pub fn capture_window(id: u32) -> Result<RgbaImage> {
         .with_context(|| format!("failed to capture window {id}"))
 }
 
+/// Whether `(x, y)` in virtual-screen physical pixels lies inside `m`.
+fn monitor_contains(m: &MonitorInfo, x: i32, y: i32) -> bool {
+    x >= m.x && x < m.x + m.width as i32 && y >= m.y && y < m.y + m.height as i32
+}
+
+/// Pick the monitor containing `at`, else the primary, else the first.
+pub fn select_monitor(monitors: &[MonitorInfo], at: Option<(i32, i32)>) -> Option<&MonitorInfo> {
+    if let Some((x, y)) = at
+        && let Some(m) = monitors.iter().find(|m| monitor_contains(m, x, y))
+    {
+        return Some(m);
+    }
+    monitors
+        .iter()
+        .find(|m| m.is_primary)
+        .or_else(|| monitors.first())
+}
+
+/// Capture the monitor under `at` (virtual-screen physical pixels). Falls back
+/// to the primary, then the first monitor. Used for region overlay so we never
+/// allocate a stitched virtual-screen buffer just to crop it back down.
+pub fn capture_monitor_at(at: Option<(i32, i32)>) -> Result<(MonitorInfo, RgbaImage)> {
+    let monitors = list_monitors()?;
+    let info = select_monitor(&monitors, at)
+        .cloned()
+        .context("no monitors found")?;
+    let image = capture_monitor(info.id)?;
+    let mut info = info;
+    if info.width != image.width() || info.height != image.height() {
+        log::warn!(
+            "monitor {} reported size {}x{} but captured image is {}x{}; using captured size",
+            info.id,
+            info.width,
+            info.height,
+            image.width(),
+            image.height()
+        );
+        info.width = image.width();
+        info.height = image.height();
+    }
+    Ok((info, image))
+}
+
 /// Capture all monitors and stitch them into one image covering the whole
 /// virtual screen. Areas not covered by any monitor are transparent black.
+///
+/// Each monitor is captured and blitted into the destination, then dropped, so
+/// peak RAM is the stitch plus one monitor rather than every monitor plus the
+/// stitch.
 pub fn capture_virtual_screen() -> Result<VirtualScreenCapture> {
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     if monitors.is_empty() {
         anyhow::bail!("no monitors found");
     }
 
-    // Capture every monitor up front and reconcile each MonitorInfo's
-    // width/height with the *actual* captured pixel buffer dimensions (see the
-    // DPI note on `monitor_info` above) so that the bounding-box math and the
-    // blit below are always self-consistent, even if a getter and the
-    // capture disagree.
-    let mut captured: Vec<(MonitorInfo, RgbaImage)> = Vec::with_capacity(monitors.len());
+    let mut infos: Vec<MonitorInfo> = Vec::with_capacity(monitors.len());
     for monitor in &monitors {
         let id = monitor.id().unwrap_or(0);
-        let mut info = monitor_info(monitor)
-            .with_context(|| format!("failed to read info for monitor {id}"))?;
-        let image = monitor
-            .capture_image()
-            .with_context(|| format!("failed to capture monitor {id} ({})", info.name))?;
-
-        if info.width != image.width() || info.height != image.height() {
-            log::warn!(
-                "monitor {id} reported size {}x{} but captured image is {}x{}; using captured size",
-                info.width,
-                info.height,
-                image.width(),
-                image.height()
-            );
-            info.width = image.width();
-            info.height = image.height();
-        }
-
-        captured.push((info, image));
+        infos.push(
+            monitor_info(monitor)
+                .with_context(|| format!("failed to read info for monitor {id}"))?,
+        );
     }
 
-    let min_x = captured.iter().map(|(info, _)| info.x).min().unwrap();
-    let min_y = captured.iter().map(|(info, _)| info.y).min().unwrap();
-    let max_x = captured
+    let min_x = infos.iter().map(|info| info.x).min().unwrap();
+    let min_y = infos.iter().map(|info| info.y).min().unwrap();
+    let max_x = infos
         .iter()
-        .map(|(info, _)| info.x + info.width as i32)
+        .map(|info| info.x + info.width as i32)
         .max()
         .unwrap();
-    let max_y = captured
+    let max_y = infos
         .iter()
-        .map(|(info, _)| info.y + info.height as i32)
+        .map(|info| info.y + info.height as i32)
         .max()
         .unwrap();
 
@@ -230,19 +257,32 @@ pub fn capture_virtual_screen() -> Result<VirtualScreenCapture> {
     // (can happen with irregular multi-monitor layouts).
     let mut image = RgbaImage::new(total_width, total_height);
 
-    let mut monitor_infos = Vec::with_capacity(captured.len());
-    for (info, monitor_image) in captured {
+    for (monitor, info) in monitors.iter().zip(infos.iter()) {
+        let id = info.id;
+        let captured = monitor
+            .capture_image()
+            .with_context(|| format!("failed to capture monitor {id} ({})", info.name))?;
+
+        if info.width != captured.width() || info.height != captured.height() {
+            log::warn!(
+                "monitor {id} reported size {}x{} but captured image is {}x{}; blitting at reported origin (clipped)",
+                info.width,
+                info.height,
+                captured.width(),
+                captured.height()
+            );
+        }
+
         let dest_x = (info.x - min_x) as i64;
         let dest_y = (info.y - min_y) as i64;
-        image::imageops::replace(&mut image, &monitor_image, dest_x, dest_y);
-        monitor_infos.push(info);
+        image::imageops::replace(&mut image, &captured, dest_x, dest_y);
     }
 
     Ok(VirtualScreenCapture {
         image,
         origin_x: min_x,
         origin_y: min_y,
-        monitors: monitor_infos,
+        monitors: infos,
     })
 }
 
@@ -341,5 +381,32 @@ mod tests {
         }
 
         max.iter().zip(min.iter()).any(|(mx, mn)| mx.saturating_sub(*mn) > 4)
+    }
+
+    fn fake_monitor(id: u32, x: i32, y: i32, w: u32, h: u32, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            name: format!("m{id}"),
+            x,
+            y,
+            width: w,
+            height: h,
+            scale_factor: 1.0,
+            is_primary: primary,
+        }
+    }
+
+    #[test]
+    fn select_monitor_prefers_the_one_under_the_point() {
+        let monitors = vec![
+            fake_monitor(1, 0, 0, 1920, 1080, true),
+            fake_monitor(2, 1920, 0, 2560, 1440, false),
+        ];
+        let picked = select_monitor(&monitors, Some((2000, 10))).unwrap();
+        assert_eq!(picked.id, 2);
+        let primary = select_monitor(&monitors, Some((-10, -10))).unwrap();
+        assert_eq!(primary.id, 1);
+        let no_point = select_monitor(&monitors, None).unwrap();
+        assert_eq!(no_point.id, 1);
     }
 }

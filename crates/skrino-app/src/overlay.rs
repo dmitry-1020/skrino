@@ -315,7 +315,7 @@ impl OverlayState {
         None
     }
 
-    fn confirm(&self) -> OverlayOutcome {
+    fn confirm(&mut self) -> OverlayOutcome {
         let Some(sel) = self.current_selection() else {
             return OverlayOutcome::Cancelled;
         };
@@ -325,8 +325,16 @@ impl OverlayState {
         }
         match self.purpose {
             OverlayPurpose::Screenshot => {
-                let cropped = image::imageops::crop_imm(&self.image, x, y, w, h).to_image();
-                OverlayOutcome::Screenshot(cropped)
+                // Drop the GPU/CPU texture before cropping so the editor does
+                // not overlap with a full-monitor copy of the same pixels.
+                self.texture = None;
+                let image = std::mem::take(&mut self.image);
+                if x == 0 && y == 0 && w == image.width() && h == image.height() {
+                    OverlayOutcome::Screenshot(image)
+                } else {
+                    let cropped = image::imageops::crop_imm(&image, x, y, w, h).to_image();
+                    OverlayOutcome::Screenshot(cropped)
+                }
             }
             OverlayPurpose::Record => OverlayOutcome::Region(RegionPx {
                 // `x`/`y` are image-pixel offsets into the monitor slice, whose

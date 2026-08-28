@@ -4,11 +4,13 @@
 //! Pipeline:
 //!   1. compute the drawing canvas (base rect unioned with annotation bounds),
 //!   2. allocate the pixmap at canvas size and fill it opaque WHITE,
-//!   3. blur regions applied to a working copy of the base pixels,
+//!   3. blur regions applied in-place on a working copy of the base *only if*
+//!      any Blur annotations exist (otherwise the base is blitted as-is),
 //!   4. blit the (blurred) base into the canvas at the canvas offset,
 //!   5. vector annotations drawn (antialiased) in insertion order, all
 //!      translated by the same canvas offset,
-//!   6. crop applied last, in the same canvas coordinate space.
+//!   6. crop applied last while unpremultiplying, so we never hold a full
+//!      straight-alpha copy plus a cropped copy at the same time.
 //!
 //! `tiny-skia` works in premultiplied RGBA; `image::RgbaImage` is straight
 //! alpha. Conversions in both directions are done explicitly so translucent
@@ -16,6 +18,8 @@
 
 mod blur;
 mod text;
+
+use std::borrow::Cow;
 
 use ab_glyph::{FontRef, PxScale};
 use image::RgbaImage;
@@ -190,13 +194,23 @@ pub fn render_document(doc: &Document, opts: &RenderOptions) -> RgbaImage {
     let cw = (canvas.max.x - canvas.min.x).max(1.0) as u32;
     let ch = (canvas.max.y - canvas.min.y).max(1.0) as u32;
 
-    // 1) Work on a copy of the base so we can blur privacy regions in place.
-    let mut work = base.clone();
-    for a in doc.annotations() {
-        if let Annotation::Blur { rect, sigma } = a {
-            blur::apply_blur(&mut work, rect, *sigma);
+    // 1) Blur privacy regions on a working copy. Skip the clone when there is
+    //    nothing to blur — the screenshot is otherwise borrowed as-is.
+    let work: Cow<'_, RgbaImage> = if doc
+        .annotations()
+        .iter()
+        .any(|a| matches!(a, Annotation::Blur { .. }))
+    {
+        let mut copy = base.clone();
+        for a in doc.annotations() {
+            if let Annotation::Blur { rect, sigma } = a {
+                blur::apply_blur(&mut copy, rect, *sigma);
+            }
         }
-    }
+        Cow::Owned(copy)
+    } else {
+        Cow::Borrowed(base)
+    };
 
     // 2) Allocate the canvas pixmap and fill it opaque WHITE. Premultiplied
     //    white is (255,255,255,255), so filling every byte with 255 works.
@@ -279,9 +293,9 @@ pub fn render_document(doc: &Document, opts: &RenderOptions) -> RgbaImage {
         }
     }
 
-    // 5) Read back to straight alpha, then crop (in canvas coordinate space).
-    let full = download_straight(&pixmap);
-    apply_crop(full, doc.crop(), off_x, off_y)
+    // 5) Unpremultiply, cropping in the same pass so we don't hold a full
+    //    straight-alpha canvas plus a cropped copy.
+    download_straight_cropped(pixmap, doc.crop(), off_x, off_y)
 }
 
 // ---------------------------------------------------------------------------
@@ -310,29 +324,69 @@ fn blit_base_premultiplied(src: &RgbaImage, dst: &mut Pixmap, off_x: i64, off_y:
     }
 }
 
-fn download_straight(src: &Pixmap) -> RgbaImage {
-    let (w, h) = (src.width(), src.height());
-    let data = src.data();
-    let mut out = RgbaImage::new(w, h);
-    for (i, px) in out.pixels_mut().enumerate() {
-        let o = i * 4;
-        let a = data[o + 3];
-        if a == 0 {
-            px.0 = [0, 0, 0, 0];
-        } else {
-            let a32 = a as u32;
-            let un = |c: u8| -> u8 { ((c as u32 * 255 + a32 / 2) / a32).min(255) as u8 };
-            px.0 = [un(data[o]), un(data[o + 1]), un(data[o + 2]), a];
-        }
+fn unpremultiply_px(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
+    if a == 0 {
+        [0, 0, 0, 0]
+    } else if a == 255 {
+        [r, g, b, a]
+    } else {
+        let a32 = a as u32;
+        let un = |c: u8| -> u8 { ((c as u32 * 255 + a32 / 2) / a32).min(255) as u8 };
+        [un(r), un(g), un(b), a]
     }
-    out
 }
 
-/// Crop the canvas-space image. `crop` is given in image coordinates; it is
-/// converted into canvas pixels via `(off_x, off_y)` and clamped to the canvas.
-fn apply_crop(img: RgbaImage, crop: Option<Rect>, off_x: f32, off_y: f32) -> RgbaImage {
-    let Some(rect) = crop else { return img };
-    let (iw, ih) = (img.width() as i64, img.height() as i64);
+fn unpremultiply_in_place(data: &mut [u8]) {
+    for px in data.chunks_exact_mut(4) {
+        let [r, g, b, a] = unpremultiply_px(px[0], px[1], px[2], px[3]);
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
+        px[3] = a;
+    }
+}
+
+/// Convert the premultiplied pixmap to a straight-alpha `RgbaImage`, applying
+/// `crop` (in image coordinates, translated by the canvas offset) without a
+/// second full-size buffer. A missing or degenerate crop yields the full canvas.
+fn download_straight_cropped(
+    pixmap: Pixmap,
+    crop: Option<Rect>,
+    off_x: f32,
+    off_y: f32,
+) -> RgbaImage {
+    let pw = pixmap.width();
+    let ph = pixmap.height();
+    if let Some((x0, y0, cw, ch)) = crop_window(crop, off_x, off_y, pw, ph)
+        && !(x0 == 0 && y0 == 0 && cw == pw && ch == ph)
+    {
+        let src = pixmap.data();
+        let mut out = RgbaImage::new(cw, ch);
+        for y in 0..ch {
+            for x in 0..cw {
+                let o = (((y0 + y) * pw + (x0 + x)) * 4) as usize;
+                out.put_pixel(
+                    x,
+                    y,
+                    image::Rgba(unpremultiply_px(src[o], src[o + 1], src[o + 2], src[o + 3])),
+                );
+            }
+        }
+        return out;
+    }
+    download_straight_owned(pixmap)
+}
+
+fn crop_window(
+    crop: Option<Rect>,
+    off_x: f32,
+    off_y: f32,
+    pw: u32,
+    ph: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let rect = crop?;
+    let iw = pw as i64;
+    let ih = ph as i64;
     let x0 = ((rect.min.x + off_x).round() as i64).clamp(0, iw);
     let y0 = ((rect.min.y + off_y).round() as i64).clamp(0, ih);
     let x1 = ((rect.max.x + off_x).round() as i64).clamp(0, iw);
@@ -340,18 +394,16 @@ fn apply_crop(img: RgbaImage, crop: Option<Rect>, off_x: f32, off_y: f32) -> Rgb
     let cw = (x1 - x0) as u32;
     let ch = (y1 - y0) as u32;
     if cw == 0 || ch == 0 {
-        // Guard against a zero-size crop: return the uncropped image rather than
-        // an empty (and useless) buffer.
-        return img;
+        return None;
     }
-    let mut out = RgbaImage::new(cw, ch);
-    for y in 0..ch {
-        for x in 0..cw {
-            let p = *img.get_pixel(x0 as u32 + x, y0 as u32 + y);
-            out.put_pixel(x, y, p);
-        }
-    }
-    out
+    Some((x0 as u32, y0 as u32, cw, ch))
+}
+
+fn download_straight_owned(mut pixmap: Pixmap) -> RgbaImage {
+    let (w, h) = (pixmap.width(), pixmap.height());
+    unpremultiply_in_place(pixmap.data_mut());
+    let data = pixmap.take();
+    RgbaImage::from_raw(w, h, data).expect("pixmap byte length matches RGBA")
 }
 
 // ---------------------------------------------------------------------------

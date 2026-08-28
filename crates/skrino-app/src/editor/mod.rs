@@ -13,6 +13,7 @@ use egui::{Color32, TextureHandle, Vec2};
 use image::RgbaImage;
 use skrino_core::{Annotation, ArrowHead, Color, Document, Point, Tool};
 
+use crate::config::EditorPrefs;
 use crate::theme::Palette;
 use crate::transform::CanvasTransform;
 
@@ -74,6 +75,9 @@ pub struct EditorState {
 
     // Active tool & style.
     tool: Tool,
+    /// Last drawing tool (Arrow/Text/shapes/marker). Select/Crop/Blur do not
+    /// overwrite this, so the next screenshot can reopen on a real drawing tool.
+    last_drawing: Tool,
     color: Color,
     thickness: f32,
     text_size: f32,
@@ -115,20 +119,25 @@ pub struct EditorState {
 }
 
 impl EditorState {
-    pub fn new(image: RgbaImage) -> Self {
+    pub fn new(image: RgbaImage, prefs: EditorPrefs) -> Self {
         let img_w = image.width();
         let img_h = image.height();
+        let prefs = prefs.sanitized();
         Self {
             doc: Document::new(image),
             img_w,
             img_h,
             texture: None,
-            tool: Tool::Select,
-            color: Color::rgb(0xE8, 0x48, 0x4D), // red — most common annotation colour
-            thickness: 4.0,
-            text_size: 24.0,
-            arrow_head: ArrowHead::Filled,
-            toolbox: ToolboxState::default(),
+            tool: prefs.tool,
+            last_drawing: prefs.tool,
+            color: prefs.color,
+            thickness: prefs.thickness,
+            text_size: prefs.text_size,
+            arrow_head: prefs.arrow_head,
+            toolbox: ToolboxState {
+                last_shape: prefs.last_shape,
+                last_marker: prefs.last_marker,
+            },
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit_pending: true,
@@ -324,6 +333,23 @@ impl EditorState {
         }
     }
 
+    /// Snapshot of tool/style to persist across sessions (and UI processes).
+    pub fn prefs(&self) -> EditorPrefs {
+        EditorPrefs {
+            tool: if EditorPrefs::is_drawing_tool(self.tool) {
+                self.tool
+            } else {
+                self.last_drawing
+            },
+            thickness: self.thickness.clamp(2.0, 12.0),
+            text_size: self.text_size.clamp(14.0, 48.0),
+            arrow_head: self.arrow_head,
+            color: self.color,
+            last_shape: self.toolbox.last_shape,
+            last_marker: self.toolbox.last_marker,
+        }
+    }
+
     /// Last-used subtype of the "Фигуры" group (Rect/Ellipse/Line/Counter).
     fn toolbox_last_shape(&self) -> Tool {
         self.toolbox.last_shape
@@ -342,6 +368,9 @@ impl EditorState {
             Tool::Rect | Tool::Ellipse | Tool::Line | Tool::Counter => self.toolbox.last_shape = tool,
             Tool::Marker | Tool::Pen => self.toolbox.last_marker = tool,
             _ => {}
+        }
+        if EditorPrefs::is_drawing_tool(tool) {
+            self.last_drawing = tool;
         }
         if self.tool == tool {
             return;
@@ -377,4 +406,26 @@ impl EditorState {
 /// Convert a core colour into an egui colour.
 pub fn c32(c: Color) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::RgbaImage;
+
+    #[test]
+    fn new_editor_starts_on_prefs_and_ignores_select_when_saving() {
+        let mut ed = EditorState::new(RgbaImage::new(4, 4), EditorPrefs::default());
+        assert_eq!(ed.tool, Tool::Arrow);
+        assert_eq!(ed.arrow_head, ArrowHead::Tapered);
+        assert_eq!(ed.thickness, 12.0);
+
+        ed.set_tool(Tool::Select);
+        assert_eq!(ed.prefs().tool, Tool::Arrow, "Select must not become the next default");
+
+        ed.set_tool(Tool::Pen);
+        let prefs = ed.prefs();
+        assert_eq!(prefs.tool, Tool::Pen);
+        assert_eq!(prefs.last_marker, Tool::Pen);
+    }
 }
