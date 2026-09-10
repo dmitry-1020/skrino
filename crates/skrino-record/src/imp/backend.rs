@@ -678,10 +678,12 @@ impl RecorderImpl {
             return Err(RecordError::Encoder(msg));
         }
 
-        // The MF sink writes moov after mdat, which streaming players (Telegram
-        // inline preview) cannot start until fully downloaded. Rewrite the file
-        // to faststart (moov before mdat) now that it is fully flushed. This is
-        // best effort: on any failure the original playable file is left intact.
+        // The MF sink writes a file strict streaming players reject: moov after
+        // mdat, an always-present but zero-sample audio track (windows-capture
+        // registers both streams even with audio disabled), and exotic mp42
+        // ftyp brands. Repack to faststart layout, drop the empty track, and
+        // rebrand to canonical isom. Best effort: on any failure the original
+        // playable file is left intact.
         faststart::make_faststart(&self.output);
 
         Ok(self.output.clone())
@@ -826,8 +828,9 @@ mod tests {
             meta.len()
         );
 
-        // The faststart post-process must have moved moov before mdat so the
-        // file streams inline (Telegram etc.).
+        // The repack must have moved moov before mdat (faststart layout) and
+        // dropped the zero-sample audio track the MF sink always registers, so
+        // strict streaming players (Telegram inline preview) accept the file.
         let order = top_level_box_order(&output);
         let moov_pos = order.iter().position(|t| t == b"moov");
         let mdat_pos = order.iter().position(|t| t == b"mdat");
@@ -838,6 +841,16 @@ mod tests {
                 .iter()
                 .map(|t| String::from_utf8_lossy(t).into_owned())
                 .collect::<Vec<_>>()
+        );
+        let bytes = std::fs::read(&output).expect("read mp4 for track/brand checks");
+        assert!(
+            !bytes.windows(4).any(|w| w == b"soun"),
+            "a video-only recording must not carry an audio track (not even an empty one)"
+        );
+        assert_eq!(
+            &bytes[8..12],
+            b"isom",
+            "ftyp major brand should be canonical isom"
         );
 
         eprintln!(
@@ -883,9 +896,14 @@ mod tests {
 
         // The AAC sample-entry box type `mp4a` appears in the audio track's stsd;
         // its presence proves a muxed audio track exists (no full mp4 parser
-        // needed). Video-only files never contain it.
+        // needed). Video-only files never contain it. With an audio track
+        // present, the sound handler must survive the repack too.
         let has_aac = bytes.windows(4).any(|w| w == b"mp4a");
         assert!(has_aac, "expected an AAC (mp4a) audio track in the mp4");
+        assert!(
+            bytes.windows(4).any(|w| w == b"soun"),
+            "expected the sound track handler to survive the repack"
+        );
 
         eprintln!(
             "recorded {} bytes to {} with audio track (mp4a: {has_aac})",

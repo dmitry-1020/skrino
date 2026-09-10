@@ -1,11 +1,31 @@
-//! qt-faststart post-process for the finished .mp4.
+//! MP4 compatibility repack for the finished recording.
 //!
-//! The Media Foundation MP4 sink writes the `moov` box AFTER `mdat`
-//! (`ftyp, uuid, mdat, moov`). Progressive / streaming players (Telegram inline
-//! preview and friends) need `moov` BEFORE `mdat` so the sample tables are
-//! available without seeking to the tail of the file. `windows-capture` does not
-//! expose the MF "fast start" attribute, so we rewrite the box order ourselves
-//! once the encoder has fully flushed the file.
+//! The Media Foundation MP4 sink produces files that lenient local players
+//! accept but strict streaming players (Telegram inline preview and friends)
+//! reject. Three problems are fixed here in one streaming rewrite:
+//!
+//! 1. **`moov` after `mdat`.** The MF sink writes `ftyp, uuid, mdat, moov`;
+//!    progressive players need the sample tables (`moov`) before the bulk
+//!    (`mdat`) so playback can start before the whole file is downloaded.
+//!    `windows-capture` does not expose the MF "fast start" attribute, so the
+//!    box order is rewritten here once the encoder has fully flushed the file.
+//! 2. **Empty audio track.** `windows-capture` 2.x registers a video AND an
+//!    audio stream with its `MediaStreamSource` unconditionally; with audio
+//!    disabled it just answers every audio sample request with `None`, so the
+//!    finalized mp4 still carries a fully formed but zero-sample audio track
+//!    (`stsz`/`stco` empty, `mdhd` duration 0). Strict clients (Telegram on
+//!    mobile, AVFoundation-based players) refuse to play such files at all.
+//!    Zero-sample tracks are removed during the rewrite; at least one track is
+//!    always kept, and tracks with any samples are never touched.
+//! 3. **Exotic `ftyp` brands.** MF writes major brand `mp42` with compatible
+//!    brands `mp41, isom`. Canonical ffmpeg-style branding (`isom` major,
+//!    compatible `isom, iso2, avc1, mp41`) is what every streaming player is
+//!    tested against, so the `ftyp` is replaced with that block.
+//!
+//! Chunk offset tables (`stco`/`co64`) are re-pointed at the relocated `mdat`.
+//! The delta can be positive (moov moved in front of mdat) or negative (moov
+//! shrank because an empty track was dropped) or zero; it is applied as a
+//! wrapping add, so both directions work.
 //!
 //! This module is intentionally pure byte/IO manipulation with no OS calls, so
 //! it compiles and unit-tests on any platform. The transform is:
@@ -14,22 +34,24 @@
 //!    4-byte type. `size == 1` means the real size is the following 8-byte
 //!    big-endian largesize; `size == 0` means "to end of file" (typically the
 //!    `mdat`). All three forms are handled.
-//! 2. If `moov` already precedes `mdat`, the file is already faststart and is
-//!    left untouched (idempotent).
-//! 3. Otherwise read the (small, ~KBs) `moov` fully into memory and, walking
-//!    ONLY the container chain `moov -> trak -> mdia -> minf -> stbl`, add the
-//!    `moov` box length (`delta`) to every 32-bit `stco` / 64-bit `co64` chunk
-//!    offset. Those offsets point into `mdat`, which shifts down by exactly the
-//!    inserted `moov` length. A proper recursive box walk is used, never an
-//!    ASCII scan for "stco"/"co64" (which could match payload bytes).
-//! 4. Stream the result into a sibling temp file (`ftyp`/`uuid` at their original
-//!    positions, then the patched `moov`, then `mdat` streamed in chunks, then
-//!    any boxes that followed `mdat` except the original `moov`) and atomically
-//!    replace the original.
+//! 2. Read the (small, ~KBs) `moov` fully into memory and drop empty tracks
+//!    from it.
+//! 3. Walk ONLY the container chain `moov -> trak -> mdia -> minf -> stbl`,
+//!    adding the net `mdat` shift to every 32-bit `stco` / 64-bit `co64` chunk
+//!    offset. A proper recursive box walk is used, never an ASCII scan for
+//!    "stco"/"co64" (which could match payload bytes).
+//! 4. Stream the result into a sibling temp file (`ftyp` patched or copied at
+//!    its original position, the other leading boxes, the patched `moov` at its
+//!    original position if it already preceded `mdat`, otherwise right before
+//!    `mdat`, then `mdat` streamed in chunks, then any boxes that followed
+//!    `mdat` except the original trailing `moov`) and atomically replace the
+//!    original.
 //!
-//! Any error or unexpected layout is a no-op: the original file is left intact
-//! and the caller still returns a playable (non-faststart) path. Failure here
-//! must never fail the recording or corrupt the file.
+//! When nothing needs fixing (already faststart, canonical `ftyp`, no empty
+//! tracks) the file is left untouched (idempotent). Any error or unexpected
+//! layout is a no-op: the original file is left intact and the caller still
+//! returns a playable path. Failure here must never fail the recording or
+//! corrupt the file.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -39,6 +61,17 @@ use std::path::{Path, PathBuf};
 /// `mdat` can be hundreds of MB, so it is never loaded fully into memory.
 const COPY_CHUNK: usize = 1024 * 1024;
 
+/// The `ftyp` block every mainstream muxer writes and every streaming player is
+/// tested against: major brand `isom`, minor version 0x200, compatible brands
+/// `isom`, `iso2`, `avc1`, `mp41` (the Media Foundation sink instead writes a
+/// 24-byte `mp42`-major block).
+const CANONICAL_FTYP: [u8; 32] = *b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41";
+
+/// `ftyp` sizes that may be replaced by [`CANONICAL_FTYP`]: the 24-byte Media
+/// Foundation block and a 32-byte block with non-canonical content. Anything
+/// else is left alone (conservative).
+const PATCHABLE_FTYP_SIZES: [u64; 2] = [24, 32];
+
 /// Container boxes whose children we descend into while hunting for chunk offset
 /// tables. Anything else (e.g. `stsd`, `dinf`, `edts`) is left untouched: it
 /// never contains an `stco`/`co64` that points into `mdat`.
@@ -46,16 +79,193 @@ fn is_container(box_type: &[u8; 4]) -> bool {
     matches!(box_type, b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl")
 }
 
-/// One top-level box as located in the file.
+/// One box header, parsed.
 #[derive(Clone, Copy)]
 struct BoxEntry {
     box_type: [u8; 4],
-    /// Byte offset of the box header (its size field) in the file.
+    /// Byte offset of the box header (its size field) in the file/buffer.
     offset: u64,
     /// Header length: 8 for a 32-bit size, 16 for a 64-bit largesize.
     header_len: u64,
     /// Full box length including the header.
     total_len: u64,
+}
+
+/// Parse the box header at `pos`. Returns `None` for any malformed or
+/// out-of-bounds header.
+fn parse_box_header(buf: &[u8], pos: usize, end: usize) -> Option<BoxEntry> {
+    if pos + 8 > end {
+        return None;
+    }
+    let size32 = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as u64;
+    let box_type = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
+    let (header_len, total_len) = if size32 == 1 {
+        if pos + 16 > end {
+            return None;
+        }
+        let large = u64::from_be_bytes([
+            buf[pos + 8],
+            buf[pos + 9],
+            buf[pos + 10],
+            buf[pos + 11],
+            buf[pos + 12],
+            buf[pos + 13],
+            buf[pos + 14],
+            buf[pos + 15],
+        ]);
+        (16u64, large)
+    } else if size32 == 0 {
+        // "To end of buffer" (top-level mdat form); meaningless for children, so
+        // only accepted by the top-level reader which bounds `end` by the file.
+        (8u64, end.saturating_sub(pos) as u64)
+    } else {
+        (8u64, size32)
+    };
+    if total_len < header_len || pos as u64 + total_len > end as u64 {
+        return None;
+    }
+    Some(BoxEntry {
+        box_type,
+        offset: pos as u64,
+        header_len,
+        total_len,
+    })
+}
+
+/// One direct child of a container box, as a byte range covering the whole
+/// child box (header included).
+struct ChildBox {
+    box_type: [u8; 4],
+    start: usize,
+    end: usize,
+}
+
+/// Parse the direct children of the container box occupying `buf[start..end]`.
+/// `start` must point at the container's own header; children begin right after
+/// it (`moov`/`trak`/`mdia`/`minf`/`stbl` are plain boxes with no version/flags
+/// word). Returns `None` on any malformed child.
+fn child_boxes(buf: &[u8], start: usize, end: usize) -> Option<Vec<ChildBox>> {
+    let header = parse_box_header(buf, start, end)?;
+    let mut pos = start + header.header_len as usize;
+    let mut children = Vec::new();
+    while pos + 8 <= end {
+        let c = parse_box_header(buf, pos, end)?;
+        let cend = pos + c.total_len as usize;
+        children.push(ChildBox {
+            box_type: c.box_type,
+            start: pos,
+            end: cend,
+        });
+        pos = cend;
+    }
+    if pos != end {
+        return None;
+    }
+    Some(children)
+}
+
+/// Count the media samples and chunks declared by the track occupying
+/// `buf[start..end]` (a `trak` box range): `stsz`/`stz2` sample count and
+/// `stco`/`co64` entry count inside its `stbl`. Returns `None` when the sample
+/// tables are missing or malformed, i.e. emptiness cannot be proven.
+fn trak_media_counts(buf: &[u8], start: usize, end: usize) -> Option<(u64, u64)> {
+    let mut samples: Option<u64> = None;
+    let mut chunks: Option<u64> = None;
+
+    fn walk(
+        buf: &[u8],
+        start: usize,
+        end: usize,
+        samples: &mut Option<u64>,
+        chunks: &mut Option<u64>,
+    ) {
+        let Some(children) = child_boxes(buf, start, end) else {
+            return;
+        };
+        for c in children {
+            match &c.box_type {
+                b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                    walk(buf, c.start, c.end, samples, chunks);
+                }
+                b"stsz" | b"stz2" => {
+                    // stsz: version/flags(4), sample_size(4), sample_count(4).
+                    // stz2: version/flags(4), reserved(3), field_size(1), sample_count(4).
+                    // Body starts at box_start+8, so the count sits at +16.
+                    if c.end - c.start >= 20 {
+                        *samples = Some(u32::from_be_bytes(
+                            buf[c.start + 16..c.start + 20].try_into().unwrap(),
+                        ) as u64);
+                    }
+                }
+                b"stco" | b"co64" => {
+                    // version/flags(4), entry_count(4): the count sits at
+                    // box_start+8+4 = +12.
+                    if c.end - c.start >= 16 {
+                        *chunks = Some(u32::from_be_bytes(
+                            buf[c.start + 12..c.start + 16].try_into().unwrap(),
+                        ) as u64);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(buf, start, end, &mut samples, &mut chunks);
+    Some((samples?, chunks?))
+}
+
+/// Remove zero-sample tracks (empty audio written by the MF sink when recording
+/// audio was disabled) from the `moov` bytes. Returns the number of bytes
+/// removed, or 0 when nothing was dropped (no empty tracks, or dropping would
+/// leave the movie without any track, or the box structure is not provably
+/// intact). Kept children keep their order; the outer `moov` size is fixed up.
+fn strip_empty_traks(moov: &mut Vec<u8>) -> u64 {
+    let original_len = moov.len() as u64;
+    let Some(children) = child_boxes(moov, 0, moov.len()) else {
+        return 0;
+    };
+
+    let mut empty: Vec<(usize, usize)> = Vec::new();
+    let mut trak_total = 0usize;
+    for c in &children {
+        if c.box_type != *b"trak" {
+            continue;
+        }
+        trak_total += 1;
+        if trak_media_counts(moov, c.start, c.end) == Some((0, 0)) {
+            empty.push((c.start, c.end));
+        }
+    }
+    // A movie must keep at least one track; if every track is empty the file is
+    // broken in a way this pass should not try to fix.
+    if trak_total == 0 || empty.is_empty() || empty.len() == trak_total {
+        return 0;
+    }
+
+    // A moov box is a plain box: [header][children...]. Rebuild from the kept
+    // children, preserving order.
+    let Some(header) = parse_box_header(moov, 0, moov.len()) else {
+        return 0;
+    };
+    let mut out = Vec::with_capacity(moov.len());
+    out.extend_from_slice(&moov[..header.header_len as usize]);
+    for c in &children {
+        if empty.contains(&(c.start, c.end)) {
+            continue;
+        }
+        out.extend_from_slice(&moov[c.start..c.end]);
+    }
+    let new_len = out.len() as u64;
+    if header.header_len == 8 {
+        out[0..4].copy_from_slice(&(new_len as u32).to_be_bytes());
+    } else {
+        out[0..4].copy_from_slice(&1u32.to_be_bytes());
+        out[8..16].copy_from_slice(&new_len.to_be_bytes());
+    }
+    let removed = original_len - new_len;
+    *moov = out;
+    removed
 }
 
 /// Outcome of the on-disk transform, used only for logging.
@@ -73,22 +283,24 @@ enum PlanResult {
 }
 
 /// Everything needed to stream the rewritten file: the original top-level box
-/// map plus the already-patched `moov` bytes to splice in before `mdat`.
+/// map, the replacement `ftyp` (if branding needed fixing), and the fully
+/// patched `moov` bytes (empty tracks dropped, chunk offsets re-pointed).
 struct RewritePlan {
     boxes: Vec<BoxEntry>,
     moov_idx: usize,
     mdat_idx: usize,
+    patched_ftyp: Option<Vec<u8>>,
     patched_moov: Vec<u8>,
 }
 
-/// Public entry: rewrite `path` in place to faststart layout, logging (in
-/// Russian) on skip/failure and never returning an error. A skip or failure
-/// leaves the original file byte-for-byte intact.
+/// Public entry: rewrite `path` in place to the streaming-friendly layout,
+/// logging (in Russian) on skip/failure and never returning an error. A skip or
+/// failure leaves the original file byte-for-byte intact.
 pub(crate) fn make_faststart(path: &Path) {
     match faststart_file(path) {
         Ok(Outcome::Rewritten) => {
             log::debug!(
-                "skrino-record: mp4 переупакован для потокового воспроизведения (moov перед mdat)"
+                "skrino-record: mp4 переупакован для потокового воспроизведения (moov перед mdat, пустые дорожки убраны)"
             );
         }
         Ok(Outcome::AlreadyFaststart) => {}
@@ -105,9 +317,9 @@ pub(crate) fn make_faststart(path: &Path) {
     }
 }
 
-/// Rewrite `path` to faststart layout. Streams `mdat` and replaces the original
-/// atomically. Returns the outcome; on any IO error the original is untouched
-/// (the temp file, if any, is removed).
+/// Rewrite `path` to the streaming layout. Streams `mdat` and replaces the
+/// original atomically. Returns the outcome; on any IO error the original is
+/// untouched (the temp file, if any, is removed).
 fn faststart_file(path: &Path) -> io::Result<Outcome> {
     let mut src = File::open(path)?;
     let file_len = src.metadata()?.len();
@@ -140,8 +352,8 @@ fn faststart_file(path: &Path) -> io::Result<Outcome> {
 }
 
 /// Parse top-level boxes from `src`, decide whether a rewrite is needed, and if
-/// so read and patch the `moov` box. Reads only headers plus the small `moov`;
-/// never touches `mdat`.
+/// so produce the patched `ftyp` and `moov` bytes. Reads only headers plus the
+/// small `moov`; never touches `mdat`.
 fn plan_faststart<R: Read + Seek>(src: &mut R, file_len: u64) -> io::Result<PlanResult> {
     let boxes = match read_top_boxes(src, file_len)? {
         Some(boxes) => boxes,
@@ -154,18 +366,50 @@ fn plan_faststart<R: Read + Seek>(src: &mut R, file_len: u64) -> io::Result<Plan
         (Some(m), Some(d)) => (m, d),
         _ => return Ok(PlanResult::Skipped("в mp4 нет moov или mdat")),
     };
-    if moov_idx < mdat_idx {
-        return Ok(PlanResult::AlreadyFaststart);
+
+    // Brand fix: replace a non-canonical first `ftyp` of a known size with the
+    // canonical ffmpeg-style block.
+    let mut patched_ftyp: Option<Vec<u8>> = None;
+    if let Some(first) = boxes.first()
+        && first.box_type == *b"ftyp"
+        && PATCHABLE_FTYP_SIZES.contains(&first.total_len)
+    {
+        src.seek(SeekFrom::Start(first.offset))?;
+        let mut cur = vec![0u8; first.total_len as usize];
+        src.read_exact(&mut cur)?;
+        if cur != CANONICAL_FTYP {
+            patched_ftyp = Some(CANONICAL_FTYP.to_vec());
+        }
     }
 
+    // Read and patch the moov: drop empty tracks first, then re-point chunk
+    // offsets by the net mdat shift (new bytes before mdat minus old).
     let moov = boxes[moov_idx];
     src.seek(SeekFrom::Start(moov.offset))?;
     let mut patched_moov = vec![0u8; moov.total_len as usize];
     src.read_exact(&mut patched_moov)?;
+    let removed = strip_empty_traks(&mut patched_moov);
 
-    // moov is inserted immediately before mdat, so mdat (and only mdat, since
-    // moov was the trailing box) shifts down by exactly the moov length.
-    let delta = moov.total_len;
+    let ftyp_delta: i64 = match &patched_ftyp {
+        Some(v) => v.len() as i64 - boxes[0].total_len as i64,
+        None => 0,
+    };
+    let moov_moves_front = moov_idx > mdat_idx;
+    // Net mdat shift. With moov moving in front of mdat, the inserted bytes are
+    // the (possibly shrunk) moov. With moov already leading the file, only its
+    // shrinkage matters. The dropped-track byte count is already reflected in
+    // the shrunk moov length, so it is never subtracted separately.
+    let delta: i64 = if moov_moves_front {
+        patched_moov.len() as i64
+    } else {
+        patched_moov.len() as i64 - moov.total_len as i64
+    } + ftyp_delta;
+
+    let needs_rewrite = moov_moves_front || patched_ftyp.is_some() || removed > 0;
+    if !needs_rewrite {
+        return Ok(PlanResult::AlreadyFaststart);
+    }
+
     let moov_len = patched_moov.len();
     if !patch_boxes(&mut patched_moov, moov.header_len as usize, moov_len, delta) {
         return Ok(PlanResult::Skipped("не удалось обновить таблицы смещений mdat"));
@@ -175,24 +419,39 @@ fn plan_faststart<R: Read + Seek>(src: &mut R, file_len: u64) -> io::Result<Plan
         boxes,
         moov_idx,
         mdat_idx,
+        patched_ftyp,
         patched_moov,
     }))
 }
 
-/// Stream the faststart layout to `out`: boxes before `mdat` in original order,
-/// then the patched `moov`, then `mdat`, then boxes after `mdat` except the
-/// original `moov`. `mdat` is streamed in [`COPY_CHUNK`] slices.
+/// Stream the new layout to `out`: the replacement `ftyp` first (when branded),
+/// the remaining leading boxes in original order, the patched `moov` at its
+/// original position when it already preceded `mdat` (otherwise right before
+/// `mdat`), then `mdat`, then boxes after `mdat` except the original trailing
+/// `moov`. `mdat` is streamed in [`COPY_CHUNK`] slices.
 fn write_plan<R: Read + Seek, W: Write>(
     src: &mut R,
     out: &mut W,
     plan: &RewritePlan,
 ) -> io::Result<()> {
     for (i, b) in plan.boxes.iter().enumerate() {
-        if i == plan.mdat_idx {
-            out.write_all(&plan.patched_moov)?;
-            copy_range(src, out, b.offset, b.total_len)?;
+        if i == 0 && b.box_type == *b"ftyp" {
+            match &plan.patched_ftyp {
+                Some(ftyp) => out.write_all(ftyp)?,
+                None => copy_range(src, out, b.offset, b.total_len)?,
+            }
         } else if i == plan.moov_idx {
-            // Emitted above, right before mdat; skip its original tail position.
+            if plan.moov_idx < plan.mdat_idx {
+                // moov already led the file; it stays in place, patched.
+                out.write_all(&plan.patched_moov)?;
+            }
+            // Otherwise it is emitted right before mdat below; skip its
+            // original tail position.
+        } else if i == plan.mdat_idx {
+            if plan.moov_idx > plan.mdat_idx {
+                out.write_all(&plan.patched_moov)?;
+            }
+            copy_range(src, out, b.offset, b.total_len)?;
         } else {
             copy_range(src, out, b.offset, b.total_len)?;
         }
@@ -248,41 +507,20 @@ fn read_top_boxes<R: Read + Seek>(src: &mut R, file_len: u64) -> io::Result<Opti
 }
 
 /// Recursively walk the boxes contained in `buf[start..end]`, descending into
-/// the known container chain and adding `delta` to every `stco`/`co64` chunk
-/// offset found. Returns `false` on any malformed child box (caller then skips
-/// the transform, leaving the file intact). Every slice access is bounds-checked
-/// against `end`, so malformed input can never panic.
-fn patch_boxes(buf: &mut [u8], start: usize, end: usize, delta: u64) -> bool {
+/// the known container chain and adding `delta` (which may be negative) to
+/// every `stco`/`co64` chunk offset found. Returns `false` on any malformed
+/// child box (caller then skips the transform, leaving the file intact). Every
+/// slice access is bounds-checked against `end`, so malformed input can never
+/// panic.
+fn patch_boxes(buf: &mut [u8], start: usize, end: usize, delta: i64) -> bool {
     let mut pos = start;
     while pos + 8 <= end {
-        let size32 = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as u64;
-        let box_type = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
-
-        let (header_len, total_len) = if size32 == 1 {
-            if pos + 16 > end {
-                return false;
-            }
-            let large = u64::from_be_bytes([
-                buf[pos + 8],
-                buf[pos + 9],
-                buf[pos + 10],
-                buf[pos + 11],
-                buf[pos + 12],
-                buf[pos + 13],
-                buf[pos + 14],
-                buf[pos + 15],
-            ]);
-            (16usize, large as usize)
-        } else if size32 == 0 {
-            (8usize, end - pos)
-        } else {
-            (8usize, size32 as usize)
-        };
-
-        if total_len < header_len || pos + total_len > end {
+        let Some(entry) = parse_box_header(buf, pos, end) else {
             return false;
-        }
-        let payload_start = pos + header_len;
+        };
+        let total_len = entry.total_len as usize;
+        let box_type = entry.box_type;
+        let payload_start = pos + entry.header_len as usize;
         let payload_end = pos + total_len;
 
         if is_container(&box_type) {
@@ -304,9 +542,9 @@ fn patch_boxes(buf: &mut [u8], start: usize, end: usize, delta: u64) -> bool {
 
 /// Patch an `stco` box body (`buf[start..end]`): 4 bytes version/flags, a u32
 /// entry count, then that many 32-bit chunk offsets. Each offset points into
-/// `mdat` and only grows, so `delta` is added wrapping into u32 (a >4 GiB file
-/// would use `co64`, not `stco`).
-fn patch_stco(buf: &mut [u8], start: usize, end: usize, delta: u64) -> bool {
+/// `mdat` and is shifted by `delta` (wrapping, so a negative delta works; only
+/// a >4 GiB file would use `co64` where the full 64-bit wrap applies).
+fn patch_stco(buf: &mut [u8], start: usize, end: usize, delta: i64) -> bool {
     if start + 8 > end {
         return false;
     }
@@ -330,7 +568,7 @@ fn patch_stco(buf: &mut [u8], start: usize, end: usize, delta: u64) -> bool {
 }
 
 /// Patch a `co64` box body: like `stco` but with 64-bit offsets.
-fn patch_co64(buf: &mut [u8], start: usize, end: usize, delta: u64) -> bool {
+fn patch_co64(buf: &mut [u8], start: usize, end: usize, delta: i64) -> bool {
     if start + 8 > end {
         return false;
     }
@@ -356,7 +594,7 @@ fn patch_co64(buf: &mut [u8], start: usize, end: usize, delta: u64) -> bool {
             buf[p + 6],
             buf[p + 7],
         ]);
-        buf[p..p + 8].copy_from_slice(&v.wrapping_add(delta).to_be_bytes());
+        buf[p..p + 8].copy_from_slice(&v.wrapping_add(delta as u64).to_be_bytes());
     }
     true
 }
@@ -406,8 +644,8 @@ mod tests {
     use std::io::Cursor;
 
     /// Pure in-memory transform used by the unit tests: parse `data`, and if a
-    /// rewrite is warranted produce the faststart bytes. `None` means "leave the
-    /// original as-is" (already faststart, no moov/mdat, or malformed).
+    /// rewrite is warranted produce the new bytes. `None` means "leave the
+    /// original as-is" (nothing to fix, or malformed).
     fn faststart_bytes(data: &[u8]) -> Option<Vec<u8>> {
         let mut src = Cursor::new(data);
         let plan = match plan_faststart(&mut src, data.len() as u64).ok()? {
@@ -437,6 +675,13 @@ mod tests {
         p
     }
 
+    fn stsz_payload(sample_count: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 4]; // version + flags
+        p.extend_from_slice(&0u32.to_be_bytes()); // uniform sample size
+        p.extend_from_slice(&sample_count.to_be_bytes());
+        p
+    }
+
     fn co64_payload(offsets: &[u64]) -> Vec<u8> {
         let mut p = vec![0u8; 4];
         p.extend_from_slice(&(offsets.len() as u32).to_be_bytes());
@@ -454,10 +699,39 @@ mod tests {
         make_box(b"trak", &mdia)
     }
 
-    /// Build `ftyp + mdat + moov` (non-faststart). Returns the file bytes, the
-    /// moov length, and where the mdat *data* begins in the file.
-    fn build_mp4(traks: &[Vec<u8>], mdat_data: &[u8]) -> (Vec<u8>, usize, usize) {
-        let ftyp = make_box(b"ftyp", b"isomiso2");
+    /// A track with sample tables proving it is empty (what the MF sink writes
+    /// for disabled audio): stsz sample_count=0 plus an stco with no entries.
+    fn make_empty_trak() -> Vec<u8> {
+        let mut stbl = make_box(b"stsz", &stsz_payload(0));
+        stbl.extend_from_slice(&make_box(b"stco", &stco_payload(&[])));
+        let minf = make_box(b"minf", &stbl);
+        let mdia = make_box(b"mdia", &minf);
+        make_box(b"trak", &mdia)
+    }
+
+    /// Count `trak` children of the (first) moov box in `data` via a real box
+    /// walk (headers only).
+    fn trak_count(data: &[u8]) -> usize {
+        let mut src = Cursor::new(data);
+        let boxes = read_top_boxes(&mut src, data.len() as u64)
+            .unwrap()
+            .unwrap();
+        let moov = boxes.iter().find(|b| b.box_type == *b"moov").unwrap();
+        child_boxes(
+            data,
+            moov.offset as usize,
+            (moov.offset + moov.total_len) as usize,
+        )
+        .unwrap()
+        .iter()
+        .filter(|c| c.box_type == *b"trak")
+        .count()
+    }
+
+    /// Build `ftyp + mdat + moov` (non-faststart). Returns the file bytes and
+    /// the moov box length.
+    fn build_mp4(ftyp_payload: &[u8], traks: &[Vec<u8>], mdat_data: &[u8]) -> (Vec<u8>, usize) {
+        let ftyp = make_box(b"ftyp", ftyp_payload);
         let mdat = make_box(b"mdat", mdat_data);
         let mut moov_payload = Vec::new();
         for trak in traks {
@@ -467,10 +741,19 @@ mod tests {
 
         let mut file = Vec::new();
         file.extend_from_slice(&ftyp);
-        let mdat_data_start = file.len() + 8; // after mdat's 8-byte header
         file.extend_from_slice(&mdat);
         file.extend_from_slice(&moov);
-        (file, moov.len(), mdat_data_start)
+        (file, moov.len())
+    }
+
+    /// The Media Foundation-style ftyp: 24 bytes, major brand mp42.
+    fn mf_ftyp_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(b"mp42");
+        p.extend_from_slice(&0u32.to_be_bytes());
+        p.extend_from_slice(b"mp41");
+        p.extend_from_slice(b"isom");
+        p
     }
 
     /// Collect the top-level box types in order (own parser, no ffmpeg).
@@ -529,7 +812,8 @@ mod tests {
         let mdat_data: Vec<u8> = (0u8..40).collect();
         let orig_offsets = [24u32, 34, 44];
         let trak = make_trak(&make_box(b"stco", &stco_payload(&orig_offsets)));
-        let (file, moov_len, _mdat_data_start) = build_mp4(&[trak], &mdat_data);
+        // A 16-byte ftyp is not a patchable size, so branding stays untouched.
+        let (file, moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[trak], &mdat_data);
 
         // Sanity: input is non-faststart.
         assert_eq!(top_level_types(&file), vec![*b"ftyp", *b"mdat", *b"moov"]);
@@ -556,11 +840,121 @@ mod tests {
     }
 
     #[test]
+    fn mf_ftyp_is_rebranded_to_canonical_isom() {
+        let mdat_data: Vec<u8> = (0u8..40).collect();
+        let trak = make_trak(&make_box(b"stco", &stco_payload(&[24])));
+        let (file, _moov_len) = build_mp4(&mf_ftyp_payload(), &[trak], &mdat_data);
+
+        let out = faststart_bytes(&file).expect("should rewrite");
+        // The 24-byte MF ftyp became the canonical 32-byte isom block.
+        assert_eq!(&out[..32], &CANONICAL_FTYP[..]);
+        assert_eq!(top_level_types(&out), vec![*b"ftyp", *b"moov", *b"mdat"]);
+    }
+
+    #[test]
+    fn empty_audio_trak_is_dropped_and_offsets_follow_both_shifts() {
+        let mdat_data: Vec<u8> = (0u8..40).collect();
+        let video_offsets = [24u32, 34, 44];
+        let video_trak = make_trak(&make_box(b"stco", &stco_payload(&video_offsets)));
+        let empty_trak = make_empty_trak();
+        let empty_len = empty_trak.len();
+        let (file, moov_len) = build_mp4(
+            &mf_ftyp_payload(),
+            &[video_trak.clone(), empty_trak],
+            &mdat_data,
+        );
+
+        let out = faststart_bytes(&file).expect("should rewrite");
+
+        assert_eq!(top_level_types(&out), vec![*b"ftyp", *b"moov", *b"mdat"]);
+        assert_eq!(&out[..32], &CANONICAL_FTYP[..]);
+        // The empty track is gone, the video track remains.
+        assert_eq!(trak_count(&out), 1);
+        // mdat shifted by the larger ftyp (32 - 24), the inserted moov
+        // (shrunk by the dropped trak), and nothing else.
+        let expected_delta: i64 = 8 + (moov_len as i64 - empty_len as i64);
+        assert_eq!(
+            all_stco_entries(&out),
+            video_offsets
+                .iter()
+                .map(|o| (*o as i64 + expected_delta) as u32)
+                .collect::<Vec<_>>()
+        );
+        // The file shrank by exactly the dropped trak minus the ftyp growth.
+        assert_eq!(out.len() as i64, file.len() as i64 - empty_len as i64 + 8);
+    }
+
+    #[test]
+    fn track_with_samples_is_never_dropped() {
+        let mdat_data: Vec<u8> = (0u8..60).collect();
+        let video = make_trak(&make_box(b"stco", &stco_payload(&[24, 30])));
+        let mut audio_stbl = make_box(b"stsz", &stsz_payload(2));
+        audio_stbl.extend_from_slice(&make_box(b"stco", &stco_payload(&[40, 50])));
+        let audio = make_trak(&audio_stbl);
+        let (file, moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[video, audio], &mdat_data);
+
+        let out = faststart_bytes(&file).expect("should rewrite");
+        assert_eq!(trak_count(&out), 2);
+        // Both tracks' chunk offsets moved by exactly the inserted moov length.
+        assert_eq!(
+            all_stco_entries(&out),
+            vec![24 + moov_len as u32, 30 + moov_len as u32, 40 + moov_len as u32, 50 + moov_len as u32]
+        );
+    }
+
+    #[test]
+    fn all_empty_traks_are_kept() {
+        // Degenerate: every track empty. The repack must not strip the movie
+        // down to zero tracks; it still performs the faststart move.
+        let mdat_data: Vec<u8> = (0u8..40).collect();
+        let a = make_empty_trak();
+        let b = make_empty_trak();
+        let (file, _moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[a, b], &mdat_data);
+
+        let out = faststart_bytes(&file).expect("should rewrite for faststart");
+        assert_eq!(top_level_types(&out), vec![*b"ftyp", *b"moov", *b"mdat"]);
+        assert_eq!(trak_count(&out), 2);
+        assert_eq!(out.len(), file.len());
+    }
+
+    #[test]
+    fn already_faststart_with_empty_trak_gets_repaired_with_negative_shift() {
+        let mdat_data: Vec<u8> = (0u8..40).collect();
+        let video_offsets = [24u32, 34];
+        let video_trak = make_trak(&make_box(b"stco", &stco_payload(&video_offsets)));
+        let empty_trak = make_empty_trak();
+        let empty_len = empty_trak.len();
+        let moov = make_box(b"moov", &[video_trak, empty_trak].concat());
+        let mdat = make_box(b"mdat", &mdat_data);
+
+        // Already faststart (moov before mdat) with canonical branding: only the
+        // empty track warrants a rewrite.
+        let mut file = Vec::new();
+        file.extend_from_slice(&CANONICAL_FTYP);
+        file.extend_from_slice(&moov);
+        file.extend_from_slice(&mdat);
+
+        let out = faststart_bytes(&file).expect("empty track alone warrants a rewrite");
+        assert_eq!(top_level_types(&out), vec![*b"ftyp", *b"moov", *b"mdat"]);
+        assert_eq!(trak_count(&out), 1);
+        // mdat moved BACK by the dropped trak's bytes.
+        assert_eq!(
+            all_stco_entries(&out),
+            video_offsets
+                .iter()
+                .map(|o| (*o as i64 - empty_len as i64) as u32)
+                .collect::<Vec<_>>()
+        );
+        // Idempotent afterwards.
+        assert!(faststart_bytes(&out).is_none());
+    }
+
+    #[test]
     fn co64_transform_patches_64bit_offsets() {
         let mdat_data: Vec<u8> = (0u8..40).collect();
         let orig_offsets = [24u64, 34, 44];
         let trak = make_trak(&make_box(b"co64", &co64_payload(&orig_offsets)));
-        let (file, moov_len, _) = build_mp4(&[trak], &mdat_data);
+        let (file, moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[trak], &mdat_data);
 
         let out = faststart_bytes(&file).expect("should rewrite");
         assert_eq!(top_level_types(&out), vec![*b"ftyp", *b"moov", *b"mdat"]);
@@ -582,7 +976,7 @@ mod tests {
         let b = [40u32, 50, 55];
         let trak_a = make_trak(&make_box(b"stco", &stco_payload(&a)));
         let trak_b = make_trak(&make_box(b"stco", &stco_payload(&b)));
-        let (file, moov_len, _) = build_mp4(&[trak_a, trak_b], &mdat_data);
+        let (file, moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[trak_a, trak_b], &mdat_data);
 
         let out = faststart_bytes(&file).expect("should rewrite");
         let patched = all_stco_entries(&out);
@@ -595,7 +989,7 @@ mod tests {
     fn already_faststart_is_left_unchanged() {
         let mdat_data: Vec<u8> = (0u8..40).collect();
         let trak = make_trak(&make_box(b"stco", &stco_payload(&[24, 34])));
-        let (file, _moov_len, _) = build_mp4(&[trak], &mdat_data);
+        let (file, _moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[trak], &mdat_data);
         // Transform once to get a faststart file, then run again: no-op.
         let faststart = faststart_bytes(&file).expect("first pass rewrites");
         assert_eq!(top_level_types(&faststart), vec![*b"ftyp", *b"moov", *b"mdat"]);
@@ -609,7 +1003,7 @@ mod tests {
     fn truncated_input_is_skipped_without_panic() {
         let mdat_data: Vec<u8> = (0u8..40).collect();
         let trak = make_trak(&make_box(b"stco", &stco_payload(&[24, 34])));
-        let (file, _, _) = build_mp4(&[trak], &mdat_data);
+        let (file, _) = build_mp4(b"isomiso2", &[trak], &mdat_data);
         // Chop the tail so the final box's declared size runs past EOF.
         let truncated = &file[..file.len() - 5];
         let before = truncated.to_vec();
@@ -634,7 +1028,7 @@ mod tests {
         let mdat_data: Vec<u8> = (0u8..50).collect();
         let orig_offsets = [24u32, 40, 50];
         let trak = make_trak(&make_box(b"stco", &stco_payload(&orig_offsets)));
-        let (file, moov_len, _) = build_mp4(&[trak], &mdat_data);
+        let (file, moov_len) = build_mp4(b"isom\x00\x00\x00\x00isom", &[trak], &mdat_data);
 
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
